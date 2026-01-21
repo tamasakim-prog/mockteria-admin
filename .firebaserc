@@ -1,0 +1,17 @@
+{
+  "projects": {
+    "default": "mockteria-757c7",
+    "production": "mockteria-757c7",
+    "dist": "mockteria-757c7"
+  },
+  "targets": {
+    "mockteria-757c7": {
+      "hosting": {
+        "mockteria-admin": [
+          "mockteria-admin"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
