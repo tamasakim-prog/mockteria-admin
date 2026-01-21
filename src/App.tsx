@@ -1,9 +1,14 @@
 import { useState, useEffect, useMemo } from 'react';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { Save, Plus, Trash2, RefreshCw, Loader2, Settings, LayoutTemplate, Coffee, Camera, ChevronDown, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, ListFilter, Edit3, X, Globe, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search } from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
 
-// ★重要: ここにFirebaseの認証情報を入れてください
+// ★あなたのFunctions URL（変更不要）
+// ※前回の作業で設定したURLのままでOKです
+const TRANSLATE_API_URL = "https://us-central1-mockteria-757c7.cloudfunctions.net/translate"; 
+
+// --- Firebase Config ---
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -14,10 +19,11 @@ const firebaseConfig = {
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
-const PREVIEW_URL = "http://mockteria-757c7.web.app";
+const PREVIEW_URL = "http://mockkteria-757c7.web.app";
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
+const storage = getStorage(app);
 
 const LANGUAGES = [
   { code: 'en', target: 'EN-US' },
@@ -30,16 +36,15 @@ const LANGUAGES = [
 
 type MenuType = 'grand' | 'seasonal';
 
-// 共通スタイル定義
 const INPUT_STYLE = "w-full bg-zinc-950 border border-zinc-600 rounded-xl p-3 text-sm text-white placeholder-zinc-500 focus:border-orange-500 focus:ring-1 focus:ring-orange-500 focus:outline-none transition-all shadow-inner";
 const CARD_STYLE = "bg-zinc-900 p-5 rounded-3xl border border-zinc-700/50 space-y-4 shadow-xl";
 
-// AIチェック用 (レーベンシュタイン距離 & 類似度計算)
+// AIチェック用
 const calculateSimilarity = (s1: string, s2: string): number => {
   if (!s1 || !s2) return 0;
   const a = s1.toLowerCase().replace(/\s+/g, '');
   const b = s2.toLowerCase().replace(/\s+/g, '');
-  if (a.includes(b) || b.includes(a)) return 1.0; // 部分一致は完全一致扱い
+  if (a.includes(b) || b.includes(a)) return 1.0;
   
   const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
   for (let i = 0; i <= a.length; i += 1) matrix[0][i] = i;
@@ -65,6 +70,7 @@ export default function AdminApp() {
   const [activeTab, setActiveTab] = useState<'items' | 'categories' | 'header' | 'settings'>('items');
   const [isProcessing, setIsProcessing] = useState(false);
   const [showCreditModal, setShowCreditModal] = useState(false);
+  const [uploading, setUploading] = useState(false);
   
   // Search
   const [searchQuery, setSearchQuery] = useState("");
@@ -132,7 +138,6 @@ export default function AdminApp() {
     }
   }, [isGrandLocked]);
 
-  // AI Check
   useEffect(() => {
     if (!newItemName) { setNameWarning(null); return; }
     const similarItem = items.find(i => calculateSimilarity(i.name, newItemName) > 0.85);
@@ -149,57 +154,94 @@ export default function AdminApp() {
     } else { setCatWarning(null); }
   }, [newCatName, categoryList]);
 
-  // ★ AI Search Logic
   const filteredItems = useMemo(() => {
     if (!searchQuery) return items;
     return items.filter(item => {
-        // 名前、説明、価格、カテゴリすべてを検索対象にする
         const targetString = `${item.name} ${item.desc} ${item.price} ${item.category}`;
-        // 類似度0.4以上(かなり緩め)または部分一致でヒットさせる
         return calculateSimilarity(targetString, searchQuery) > 0.3;
     });
   }, [items, searchQuery]);
 
   const filteredCategoryList = useMemo(() => categoryList.filter(c => c.type === newItemType), [categoryList, newItemType]);
 
-  // --- API ---
   const translateTexts = async (texts: string[], targetLang: string) => {
+    if (TRANSLATE_API_URL.includes("xxxxxx")) return texts;
     try {
-      const response = await fetch('https://mockteria-app.vercel.app/api/translate', {
+      const response = await fetch(TRANSLATE_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: texts, target_lang: targetLang })
       });
+      
+      if (!response.ok) {
+          // エラーでも止まらずに原文を返す
+          console.warn(`Translation failed for ${targetLang}`);
+          return texts;
+      }
+
       const data = await response.json();
       return data.translations.map((t: any) => t.text);
-    } catch (e) { return texts; }
+    } catch (e) { 
+      console.error(e);
+      return texts; 
+    }
   };
 
   const saveToFirebase = async (payload: any) => {
     setIsProcessing(true);
-    try { await setDoc(doc(db, "settings", "menuData"), { ...payload, updatedAt: new Date() }, { merge: true }); }
-    catch (e) { alert("保存失敗"); } finally { setIsProcessing(false); }
+    try { 
+        await setDoc(doc(db, "settings", "menuData"), { ...payload, updatedAt: new Date() }, { merge: true }); 
+    } catch (e: any) { 
+        console.error(e);
+        if (e.code === 'resource-exhausted') alert("⚠️ 容量オーバー: 画像を減らしてください");
+        else alert("保存エラー: " + e.message); 
+    } finally { setIsProcessing(false); }
   };
 
-  const handleImageUpload = (e: any, callback: (base64: string) => void) => {
-    const file = e.target.files?.[0]; if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const scale = 800 / img.width;
-        canvas.width = 800; canvas.height = img.height * scale;
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-        callback(canvas.toDataURL('image/jpeg', 0.7));
-      };
-      img.src = ev.target?.result as string;
-    };
-    reader.readAsDataURL(file);
+  const handleImageUpload = async (e: any, callback: (url: string) => void) => {
+    const file = e.target.files?.[0]; 
+    if (!file) return;
+
+    setUploading(true);
+
+    setTimeout(() => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const img = new Image();
+          img.onload = async () => {
+            const canvas = document.createElement('canvas');
+            const maxW = 800;
+            const scale = maxW / img.width;
+            canvas.width = maxW;
+            canvas.height = img.height * scale;
+            const ctx = canvas.getContext('2d');
+            ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+    
+            canvas.toBlob(async (blob) => {
+                if (!blob) {
+                    setUploading(false);
+                    return;
+                }
+                try {
+                    const fileName = `menu-images/${Date.now()}-${file.name}`;
+                    const storageRef = ref(storage, fileName);
+                    await uploadBytes(storageRef, blob);
+                    const downloadURL = await getDownloadURL(storageRef);
+                    callback(downloadURL);
+                } catch (error) {
+                    console.error("Upload failed", error);
+                    alert("画像のアップロードに失敗しました");
+                } finally {
+                    setUploading(false);
+                }
+            }, 'image/jpeg', 0.8);
+          };
+          img.src = ev.target?.result as string;
+        };
+        reader.readAsDataURL(file);
+    }, 100);
   };
 
-  // --- Actions ---
   const addCategory = async () => {
     if (!newCatName) return;
     if (categoryList.some(c => c.name === newCatName)) return alert("同名カテゴリが存在します");
@@ -209,14 +251,17 @@ export default function AdminApp() {
     alert("カテゴリを追加しました");
   };
 
+  // ★修正: カテゴリ更新（翻訳を直列化）
   const executeCategoryUpdate = async (oldName: string, newName: string, type: MenuType) => {
       setIsProcessing(true);
       try {
         const translations: any = {};
-        await Promise.all(LANGUAGES.map(async (lang) => {
+        // 直列処理に変更
+        for (const lang of LANGUAGES) {
             const res = await translateTexts([newName], lang.target);
             translations[lang.code] = res[0];
-        }));
+        }
+        
         const newList = categoryList.map(c => c.name === oldName ? { name: newName, type } : c);
         const newItems = items.map(item => {
             if (item.category === oldName) {
@@ -239,16 +284,21 @@ export default function AdminApp() {
     await saveToFirebase({ categoryList: newList });
   };
 
+  // ★修正: 新規登録（翻訳を直列化）
   const createNewItem = async () => {
     if (!newItemName || !newItemCategory) return alert("入力不備があります");
     if (nameWarning && !confirm(`警告: ${nameWarning}\n登録しますか？`)) return;
     setIsProcessing(true);
     try {
       const trans: any = {};
-      await Promise.all(LANGUAGES.map(async (l) => {
-        const res = await translateTexts([newItemName, newItemDesc, newItemCategory], l.target);
-        trans[l.code] = { name: res[0], desc: res[1], category: res[2] };
-      }));
+      // 直列処理に変更
+      for (const l of LANGUAGES) {
+          const res = await translateTexts([newItemName, newItemDesc, newItemCategory], l.target);
+          trans[l.code] = { name: res[0], desc: res[1], category: res[2] };
+          // API制限回避のため、少し待機（オプション）
+          // await new Promise(r => setTimeout(r, 100)); 
+      }
+
       const newItem = {
         id: `id-${Date.now()}`, name: newItemName, desc: newItemDesc, price: newItemPrice, image: newItemImage, category: newItemCategory, type: newItemType, categoryEnglish: trans['en']?.category || newItemCategory, isRecommended: false, isInsta: false, isSoldOut: false, translations: trans
       };
@@ -272,17 +322,19 @@ export default function AdminApp() {
     alert("保存しました");
   };
 
+  // ★修正: 再翻訳（翻訳を直列化）
   const reTranslateAndSaveItem = async () => {
     if (!editingItem) return;
     if (!confirm(`再翻訳して上書きしますか？`)) return;
     setIsProcessing(true);
     try {
       const translations: any = {};
-      const promises = LANGUAGES.map(async (lang) => {
-        const results = await translateTexts([editingItem.name, editingItem.desc, editingItem.category], lang.target);
-        translations[lang.code] = { name: results[0], desc: results[1], category: results[2] };
-      });
-      await Promise.all(promises);
+      // 直列処理に変更
+      for (const lang of LANGUAGES) {
+          const results = await translateTexts([editingItem.name, editingItem.desc, editingItem.category], lang.target);
+          translations[lang.code] = { name: results[0], desc: results[1], category: results[2] };
+      }
+
       const updatedItem = { ...editingItem, translations, categoryEnglish: translations['en']?.category || editingItem.category };
       const newItems = items.map(i => i.id === editingItem.id ? updatedItem : i);
       await saveToFirebase({ items: newItems });
@@ -293,6 +345,19 @@ export default function AdminApp() {
 
   const deleteItem = async (itemId: string) => {
       if(!confirm("本当に削除しますか？\nこの操作は取り消せません。")) return;
+      
+      const targetItem = items.find(i => i.id === itemId);
+      
+      if (targetItem && targetItem.image && targetItem.image.startsWith('http')) {
+          try {
+              const fileRef = ref(storage, targetItem.image);
+              await deleteObject(fileRef);
+              console.log("Image deleted from storage");
+          } catch (e) {
+              console.warn("Could not delete image from storage (might already be deleted or invalid path)", e);
+          }
+      }
+
       const newItems = items.filter(i => i.id !== itemId);
       await saveToFirebase({ items: newItems });
       setEditingItem(null);
@@ -331,52 +396,71 @@ export default function AdminApp() {
       alert("カテゴリ順序を保存しました");
   };
 
-  // Header Save
+  // ★修正: ヘッダー設定（翻訳を直列化）
   const saveFeaturedSettings = async () => {
     setIsProcessing(true);
     try {
       let nextItems = [...items];
       const nextSlots = [...featuredSlots];
-      const slotPromises = nextSlots.map(async (slot, index) => {
-        if (!slot.name) return slot;
-        if (slot.type === 'event') return { ...slot, itemId: null };
-        if (slot.itemId) {
-           const existingIndex = nextItems.findIndex(i => i.id === slot.itemId);
-           if(existingIndex !== -1) nextItems[existingIndex] = { ...nextItems[existingIndex], isRecommended: true };
-           return slot;
-        }
-        const translations: any = {};
-        const promises = LANGUAGES.map(async (lang) => {
-          const results = await translateTexts([slot.name, slot.desc, slot.category || "NEW"], lang.target);
-          translations[lang.code] = { name: results[0], desc: results[1], category: results[2] };
-        });
-        await Promise.all(promises);
-        const newItemId = `id-feat-${Date.now()}-${index}`;
-        const newItem = {
-          id: newItemId, name: slot.name, desc: slot.desc, price: slot.price, image: slot.image, category: slot.category || "NEW ITEMS", categoryEnglish: translations['en']?.category || slot.category, type: slot.menuType || "grand", isRecommended: true, isSoldOut: false, translations: translations
-        };
-        nextItems.push(newItem);
-        return { ...slot, itemId: newItemId };
-      });
-      const updatedSlots = await Promise.all(slotPromises);
+      
+      // ループ内でawaitを使うため、Promise.allではなくforループに変更
+      const updatedSlots = [];
+      for (let i = 0; i < nextSlots.length; i++) {
+          const slot = nextSlots[i];
+          if (!slot.name) {
+              updatedSlots.push(slot);
+              continue;
+          }
+          if (slot.type === 'event') {
+              updatedSlots.push({ ...slot, itemId: null });
+              continue;
+          }
+          if (slot.itemId) {
+             const existingIndex = nextItems.findIndex(item => item.id === slot.itemId);
+             if(existingIndex !== -1) nextItems[existingIndex] = { ...nextItems[existingIndex], isRecommended: true };
+             updatedSlots.push(slot);
+             continue;
+          }
+
+          // 新規作成の場合の翻訳
+          const translations: any = {};
+          for (const lang of LANGUAGES) {
+              const results = await translateTexts([slot.name, slot.desc, slot.category || "NEW"], lang.target);
+              translations[lang.code] = { name: results[0], desc: results[1], category: results[2] };
+          }
+
+          const newItemId = `id-feat-${Date.now()}-${i}`;
+          const newItem = {
+            id: newItemId, name: slot.name, desc: slot.desc, price: slot.price, image: slot.image, category: slot.category || "NEW ITEMS", categoryEnglish: translations['en']?.category || slot.category, type: slot.menuType || "grand", isRecommended: true, isSoldOut: false, translations: translations
+          };
+          nextItems.push(newItem);
+          updatedSlots.push({ ...slot, itemId: newItemId });
+      }
+
       await setDoc(doc(db, "settings", "menuData"), { items: nextItems, featuredSlots: updatedSlots, tabSettings, splashSettings, updatedAt: new Date() }, { merge: true });
       alert("更新完了！");
-    } catch (e) { alert("保存エラー"); } finally { setIsProcessing(false); }
+    } catch (e: any) { 
+        console.error(e);
+        if (e.code === 'resource-exhausted') alert("⚠️ 容量オーバー: 画像を減らしてください");
+        else alert("保存エラー"); 
+    } finally { setIsProcessing(false); }
   };
 
-  // Settings Save
+  // ★修正: 一般設定（翻訳を直列化）
   const saveGeneralSettings = async () => {
     setIsProcessing(true);
     try {
       const newTabSettings = { ...tabSettings };
-      const promises = LANGUAGES.map(async (lang) => {
-        const results = await translateTexts([tabSettings.grand?.jp || "", tabSettings.seasonal?.jp || ""], lang.target);
-        if (!newTabSettings.grand) newTabSettings.grand = {};
-        if (!newTabSettings.seasonal) newTabSettings.seasonal = {};
-        newTabSettings.grand[lang.code] = results[0];
-        newTabSettings.seasonal[lang.code] = results[1];
-      });
-      await Promise.all(promises);
+      
+      // 直列処理に変更
+      for (const lang of LANGUAGES) {
+          const results = await translateTexts([tabSettings.grand?.jp || "", tabSettings.seasonal?.jp || ""], lang.target);
+          if (!newTabSettings.grand) newTabSettings.grand = {};
+          if (!newTabSettings.seasonal) newTabSettings.seasonal = {};
+          newTabSettings.grand[lang.code] = results[0];
+          newTabSettings.seasonal[lang.code] = results[1];
+      }
+
       await setDoc(doc(db, "settings", "menuData"), { items, featuredSlots, tabSettings: newTabSettings, splashSettings, updatedAt: new Date(), categoryList }, { merge: true });
       alert("設定を保存しました");
     } catch(e) { console.error(e); } finally { setIsProcessing(false); }
@@ -390,7 +474,7 @@ export default function AdminApp() {
     <div className="min-h-screen bg-black text-slate-100 font-sans pb-24">
       {/* Header */}
       <header className="sticky top-0 z-50 bg-black/80 backdrop-blur-md border-b border-white/10 px-4 py-4 flex items-center justify-between">
-        <h1 className="text-xm font-black text-white tracking-[0.2em] font-['Shippori_Mincho']">MOCKTERIA</h1>
+        <h1 className="text-xl font-black text-white tracking-[0.2em] font-['Shippori_Mincho']">MOCKTERIA</h1>
         <div className="flex items-center gap-2">
           <button onClick={() => setIsGrandLocked(!isGrandLocked)} className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold active:scale-95 transition-all ${isGrandLocked ? 'bg-zinc-800 text-zinc-400 border border-zinc-700' : 'bg-orange-500 text-black border border-orange-400 shadow-lg shadow-orange-900/50'}`}>
             {isGrandLocked ? <Lock size={14}/> : <Unlock size={14}/>}
@@ -443,9 +527,9 @@ export default function AdminApp() {
                     <div className={CARD_STYLE + " animate-in fade-in slide-in-from-top-2"}>
                         <div className="flex justify-between items-center"><span className="font-bold text-sm text-orange-500">新規商品登録</span><button onClick={() => setShowItemForm(false)} className="text-zinc-500 hover:text-white"><X size={20}/></button></div>
                         <div className="flex gap-4">
-                            <div className="w-24 h-24 bg-zinc-950 rounded-2xl border border-zinc-700 flex items-center justify-center relative overflow-hidden shrink-0">
-                            {newItemImage ? <img src={newItemImage} className="w-full h-full object-cover" /> : <Camera className="text-zinc-600" />}
-                            <input type="file" className="absolute inset-0 opacity-0" onChange={e => handleImageUpload(e, setNewItemImage)} />
+                            <div className="w-24 h-24 bg-zinc-950 rounded-2xl border border-zinc-700 flex items-center justify-center relative overflow-hidden shrink-0 group">
+                                {uploading ? <Loader2 className="animate-spin text-orange-500" /> : (newItemImage ? <img src={newItemImage} className="w-full h-full object-cover" /> : <Camera className="text-zinc-600" />)}
+                                <input type="file" className="absolute inset-0 opacity-0" onChange={e => handleImageUpload(e, setNewItemImage)} />
                             </div>
                             <div className="flex-1 space-y-3">
                             <input value={newItemName} onChange={e => setNewItemName(e.target.value)} placeholder="名前" className={INPUT_STYLE} />
@@ -458,12 +542,11 @@ export default function AdminApp() {
                             <div className="relative"><select value={newItemCategory} onChange={e => setNewItemCategory(e.target.value)} className={`${INPUT_STYLE} appearance-none`}><option value="">選択...</option>{filteredCategoryList.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}</select><ChevronDown size={14} className="absolute right-3 top-4 text-zinc-500 pointer-events-none" /></div>
                         </div>
                         <textarea value={newItemDesc} onChange={e => setNewItemDesc(e.target.value)} placeholder="説明文" className={`${INPUT_STYLE} h-24`} />
-                        <button onClick={createNewItem} disabled={isProcessing} className="w-full bg-orange-500 text-black font-black py-4 rounded-2xl flex justify-center items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-orange-900/20">{isProcessing ? <Loader2 className="animate-spin" size={18}/> : <RefreshCw size={18} />} 翻訳して登録</button>
+                        <button onClick={createNewItem} disabled={isProcessing || uploading} className="w-full bg-orange-500 text-black font-black py-4 rounded-2xl flex justify-center items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-orange-900/20">{isProcessing ? <Loader2 className="animate-spin" size={18}/> : <RefreshCw size={18} />} 翻訳して登録</button>
                     </div>
                 )}
 
                 <div className="space-y-8 pt-4">
-                  {/* 検索中ならヒットしたものが0件のときメッセージを出す */}
                   {searchQuery && filteredItems.length === 0 && (
                       <div className="text-center py-10 text-zinc-500 text-xs">
                           見つかりませんでした
@@ -471,7 +554,6 @@ export default function AdminApp() {
                   )}
 
                   {['seasonal', 'grand'].map((type) => {
-                    // 検索結果に含まれるアイテムのみをカテゴリごとにフィルタリング
                     const itemsInType = filteredItems.filter(i => (i.type || 'grand') === type);
                     if (itemsInType.length === 0) return null;
 
@@ -479,7 +561,6 @@ export default function AdminApp() {
                         <div key={type} className={`border-l-4 pl-4 ${type === 'grand' ? 'border-blue-500' : 'border-green-500'}`}>
                         <h3 className="text-sm font-black mb-4 uppercase tracking-widest flex items-center gap-2">{type === 'grand' ? '定番メニュー' : '限定メニュー'} {type==='grand' && isGrandLocked && <Lock size={12} className="text-zinc-500"/>}</h3>
                         {categoryList.filter(c => c.type === type).map(cat => {
-                            // そのカテゴリに属し、かつ検索結果に含まれるアイテムだけを表示
                             const targetItems = itemsInType.filter(i => i.category === cat.name);
                             if (targetItems.length === 0) return null;
 
@@ -523,6 +604,7 @@ export default function AdminApp() {
           </div>
         )}
 
+        {/* Categories Tab */}
         {activeTab === 'categories' && (
           <div className="space-y-6">
             <div className="flex justify-end h-10">
@@ -695,7 +777,6 @@ export default function AdminApp() {
                     <div className="flex gap-2">
                         <select value={slot.category || ""} onChange={e => {const ns=[...featuredSlots]; ns[idx].category=e.target.value; setFeaturedSlots(ns)}} className={INPUT_STYLE}>
                             <option value="">カテゴリ選択</option>
-                            {/* ヘッダー設定では全カテゴリから選択可能に */}
                             {displayCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
                         </select>
                         <select value={slot.menuType || "grand"} onChange={e => {const ns=[...featuredSlots]; ns[idx].menuType=e.target.value; setFeaturedSlots(ns)}} className={INPUT_STYLE}>
