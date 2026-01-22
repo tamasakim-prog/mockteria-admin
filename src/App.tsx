@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
-import { Save, Plus, Trash2, RefreshCw, Loader2, Settings, LayoutTemplate, Coffee, Camera, ChevronDown, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, ListFilter, Edit3, X, Globe, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search, Star } from 'lucide-react';
+import { Plus, Trash2, Loader2, Settings, LayoutTemplate, Coffee, Camera, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, ListFilter, Edit3, X, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search, Star } from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, updateDoc, setDoc, onSnapshot } from "firebase/firestore";
 
@@ -88,6 +88,7 @@ export default function AdminApp() {
   const [newItemCategory, setNewItemCategory] = useState("");
   const [newItemImage, setNewItemImage] = useState("");
 
+  // データ同期
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "settings", "menuData"), (docSnap) => {
       if (docSnap.exists()) {
@@ -101,6 +102,7 @@ export default function AdminApp() {
         
         let rawCats = data.categoryList || [];
         
+        // カテゴリ自動復旧
         if ( (!rawCats || rawCats.length === 0) && loadedItems.length > 0 ) {
             console.warn("⚠️カテゴリ消失を検知: 自動復旧します");
             const uniqueCatNames = [...new Set(loadedItems.map((i:any) => i.category))];
@@ -117,14 +119,15 @@ export default function AdminApp() {
                 return null;
             }).filter(Boolean) as any;
             
-            if (!isCatSorting && !editingCatId) {
+            // 並び替え中・編集中以外は更新を受け入れる
+            if (!isCatSorting && !editingCatId && !isProcessing && sortPhase === 'none') {
                 setCategoryList(safeCats);
             }
         }
       }
     });
     return () => unsub();
-  }, [isCatSorting, editingCatId]);
+  }, [isCatSorting, editingCatId, isProcessing, sortPhase]);
 
   useEffect(() => {
     if (isGrandLocked) { setNewItemType('seasonal'); setNewCatType('seasonal'); }
@@ -153,6 +156,8 @@ export default function AdminApp() {
   }, [items, searchQuery]);
 
   const filteredCategoryList = useMemo(() => categoryList.filter(c => c.type === newItemType), [categoryList, newItemType]);
+
+  const displayCategories = categoryList.map(c => c?.name || "Unknown");
 
   const translateTexts = async (texts: string[], targetLang: string) => {
     try {
@@ -262,6 +267,22 @@ export default function AdminApp() {
       await saveAndReload({ categoryList }, "並び順を保存しました");
   };
 
+  // --- Item Sorting ---
+  const startSorting = () => setSortPhase('select_category');
+  const exitSorting = () => { setSortPhase('none'); setTargetCategory(""); setSortingItems([]); };
+  const selectCategoryToSort = (cat: string) => { setTargetCategory(cat); setSortingItems(items.filter(i => i.category === cat)); setSortPhase('sorting'); };
+  const moveSortItem = (idx: number, dir: 'up' | 'down') => {
+    const arr = [...sortingItems];
+    if (dir === 'up' && idx > 0) [arr[idx], arr[idx-1]] = [arr[idx-1], arr[idx]];
+    if (dir === 'down' && idx < arr.length-1) [arr[idx], arr[idx+1]] = [arr[idx+1], arr[idx]];
+    setSortingItems(arr);
+  };
+  const saveSortedOrder = async () => {
+    const others = items.filter(i => i.category !== targetCategory);
+    await saveToFirebase({ items: [...others, ...sortingItems] });
+    exitSorting(); alert("商品の並び順を保存しました");
+  };
+
   // --- Item Actions ---
   const createNewItem = async () => {
     if (!newItemName) return alert("名前を入力してください");
@@ -315,6 +336,16 @@ export default function AdminApp() {
     setEditingItem(null); setIsProcessing(false); alert("翻訳更新しました");
   };
 
+  const saveToFirebase = async (payload: any) => {
+    setIsProcessing(true);
+    try { 
+        await setDoc(doc(db, "settings", "menuData"), { ...payload, updatedAt: new Date() }, { merge: true }); 
+    } catch (e: any) { 
+        console.error(e);
+        alert("保存エラー"); 
+    } finally { setIsProcessing(false); }
+  };
+
   const saveFeaturedSettings = async () => {
     setIsProcessing(true);
     await setDoc(doc(db, "settings", "menuData"), { featuredSlots, updatedAt: new Date() }, { merge: true });
@@ -326,10 +357,6 @@ export default function AdminApp() {
     await setDoc(doc(db, "settings", "menuData"), { tabSettings, splashSettings, updatedAt: new Date() }, { merge: true });
     setIsProcessing(false); alert("保存しました");
   };
-
-  const displayCategories = categoryList.map(c => c?.name || "Unknown");
-  const sortingSeasonalCats = categoryList.filter(c => c.type === 'seasonal');
-  const sortingGrandCats = categoryList.filter(c => c.type === 'grand');
 
   return (
     <div className="min-h-screen bg-black text-slate-100 font-sans pb-24">
@@ -347,69 +374,130 @@ export default function AdminApp() {
       <div className="p-4 max-w-md mx-auto">
         {activeTab === 'items' && (
           <div className="space-y-6">
-            <div className="relative mb-4">
-                <Search className="absolute left-4 top-3.5 text-zinc-500" size={18} />
-                <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search..." className="w-full bg-zinc-900 border border-zinc-700 rounded-2xl py-3 pl-12 pr-4 text-sm text-white focus:border-orange-500 outline-none" />
+            <div className="flex justify-end h-10">
+              {/* 商品並び替えボタン */}
+              {sortPhase === 'none' ? (
+                <button onClick={startSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-black">
+                  <Move size={14} className="text-orange-500"/> 並び替えモードへ
+                </button>
+              ) : (
+                <button onClick={exitSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-black">
+                  <Plus size={14} className="text-orange-500"/> 商品登録モードへ
+                </button>
+              )}
             </div>
 
-            {!showItemForm ? (
-                <button onClick={() => setShowItemForm(true)} className="w-full py-4 rounded-2xl border-2 border-dashed border-zinc-700 text-zinc-400 font-bold flex items-center justify-center gap-2 hover:bg-zinc-900"><Plus size={20}/> Add New Item</button>
-            ) : (
-                <div className={CARD_STYLE}>
-                    <div className="flex justify-between items-center"><span className="font-bold text-sm text-orange-500">新規商品登録</span><button onClick={() => setShowItemForm(false)}><X size={20}/></button></div>
-                    <div className="flex gap-4">
-                        <div className="w-24 h-24 bg-zinc-950 rounded-2xl border border-zinc-700 flex items-center justify-center relative overflow-hidden">
-                            {uploading ? <Loader2 className="animate-spin text-orange-500" /> : (newItemImage ? <img src={newItemImage} className="w-full h-full object-cover" /> : <Camera className="text-zinc-600" />)}
-                            <input type="file" className="absolute inset-0 opacity-0" onChange={e => handleImageUpload(e, setNewItemImage)} />
-                        </div>
-                        <div className="flex-1 space-y-3">
-                            <input value={newItemName} onChange={e => setNewItemName(e.target.value)} placeholder="Name" className={INPUT_STYLE} />
-                            <input value={newItemPrice} onChange={e => setNewItemPrice(e.target.value)} placeholder="Price" className={INPUT_STYLE} />
-                        </div>
-                    </div>
-                    {nameWarning && <div className="text-amber-500 text-xs">{nameWarning}</div>}
-                    <div className="grid grid-cols-2 gap-3 pt-2">
-                        <select value={newItemType} onChange={e => setNewItemType(e.target.value as any)} className={INPUT_STYLE} disabled={isGrandLocked}><option value="seasonal">Seasonal</option><option value="grand">Grand</option></select>
-                        <select value={newItemCategory} onChange={e => setNewItemCategory(e.target.value)} className={INPUT_STYLE}><option value="">Category...</option>{filteredCategoryList.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}</select>
-                    </div>
-                    <textarea value={newItemDesc} onChange={e => setNewItemDesc(e.target.value)} placeholder="Description" className={`${INPUT_STYLE} h-24`} />
-                    <button onClick={createNewItem} disabled={isProcessing} className="w-full bg-orange-500 text-black font-bold py-4 rounded-2xl">翻訳して登録</button>
+            {/* AI Search Bar */}
+            {sortPhase === 'none' && !editingItem && (
+                <div className="relative mb-4">
+                    <Search className="absolute left-4 top-3.5 text-zinc-500" size={18} />
+                    <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search..." className="w-full bg-zinc-900 border border-zinc-700 rounded-2xl py-3 pl-12 pr-4 text-sm text-white focus:border-orange-500 outline-none" />
                 </div>
             )}
 
-            <div className="space-y-8 pt-4">
-                {['seasonal', 'grand'].map(type => (
-                    <div key={type} className={`border-l-4 pl-4 ${type === 'grand' ? 'border-blue-500' : 'border-green-500'}`}>
-                        <h3 className="text-sm font-black mb-4 uppercase tracking-widest">{type} MENU</h3>
-                        {categoryList.filter(c => c.type === type).map(cat => (
-                            <div key={cat.name} className="mb-6">
-                                <h4 className="text-xs text-zinc-500 mb-2 font-bold px-1">{cat.name}</h4>
-                                <div className="space-y-2">
-                                    {filteredItems.filter(i => i.category === cat.name).map(item => (
-                                        <div key={item.id} className="bg-zinc-900 p-3 rounded-2xl border border-zinc-700 flex gap-3 items-center">
-                                            <div className="w-12 h-12 bg-black rounded-xl overflow-hidden shrink-0">
-                                              {/* ★修正: 画像がある時だけimgを表示 */}
-                                              {item.image ? (
-                                                <img src={item.image} className={`w-full h-full object-cover ${item.isSoldOut ? 'opacity-40 grayscale' : ''}`} />
-                                              ) : (
-                                                <div className="w-full h-full flex items-center justify-center text-zinc-700"><Camera size={16}/></div>
-                                              )}
-                                            </div>
-                                            <div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">{item.name}</div><div className="text-[10px] text-zinc-500">¥{item.price}</div></div>
-                                            <button onClick={() => toggleSoldOut(item)} className={`p-2 rounded-xl ${item.isSoldOut ? 'bg-red-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}><Ban size={16}/></button>
-                                            <button onClick={() => setEditingItem({...item})} className="p-2 rounded-xl bg-zinc-800 text-white" disabled={isGrandLocked && type === 'grand' && !item.isSoldOut}><Edit3 size={16}/></button>
-                                            <button onClick={() => deleteItem(item.id)} className="p-2 rounded-xl bg-zinc-800 text-red-500" disabled={isGrandLocked && type === 'grand'}><Trash2 size={16}/></button>
-                                        </div>
-                                    ))}
-                                </div>
+            {sortPhase === 'none' && (
+              <>
+                {!showItemForm && !searchQuery ? (
+                    <button onClick={() => setShowItemForm(true)} className="w-full py-4 rounded-2xl border-2 border-dashed border-zinc-700 text-zinc-400 font-bold flex items-center justify-center gap-2 hover:bg-zinc-900"><Plus size={20}/> Add New Item</button>
+                ) : showItemForm && (
+                    <div className={CARD_STYLE}>
+                        <div className="flex justify-between items-center"><span className="font-bold text-sm text-orange-500">新規商品登録</span><button onClick={() => setShowItemForm(false)}><X size={20}/></button></div>
+                        <div className="flex gap-4">
+                            <div className="w-24 h-24 bg-zinc-950 rounded-2xl border border-zinc-700 flex items-center justify-center relative overflow-hidden">
+                                {uploading ? <Loader2 className="animate-spin text-orange-500" /> : (newItemImage ? <img src={newItemImage} className="w-full h-full object-cover" /> : <Camera className="text-zinc-600" />)}
+                                <input type="file" className="absolute inset-0 opacity-0" onChange={e => handleImageUpload(e, setNewItemImage)} />
                             </div>
+                            <div className="flex-1 space-y-3">
+                                <input value={newItemName} onChange={e => setNewItemName(e.target.value)} placeholder="Name" className={INPUT_STYLE} />
+                                <input value={newItemPrice} onChange={e => setNewItemPrice(e.target.value)} placeholder="Price" className={INPUT_STYLE} />
+                            </div>
+                        </div>
+                        {nameWarning && <div className="text-amber-500 text-xs">{nameWarning}</div>}
+                        <div className="grid grid-cols-2 gap-3 pt-2">
+                            <select value={newItemType} onChange={e => setNewItemType(e.target.value as any)} className={INPUT_STYLE} disabled={isGrandLocked}><option value="seasonal">Seasonal</option><option value="grand">Grand</option></select>
+                            <select value={newItemCategory} onChange={e => setNewItemCategory(e.target.value)} className={INPUT_STYLE}><option value="">Category...</option>{filteredCategoryList.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}</select>
+                        </div>
+                        <textarea value={newItemDesc} onChange={e => setNewItemDesc(e.target.value)} placeholder="Description" className={`${INPUT_STYLE} h-24`} />
+                        <button onClick={createNewItem} disabled={isProcessing} className="w-full bg-orange-500 text-black font-bold py-4 rounded-2xl">翻訳して登録</button>
+                    </div>
+                )}
+
+                <div className="space-y-8 pt-4">
+                    {['seasonal', 'grand'].map(type => (
+                        <div key={type} className={`border-l-4 pl-4 ${type === 'grand' ? 'border-blue-500' : 'border-green-500'}`}>
+                            <h3 className="text-sm font-black mb-4 uppercase tracking-widest">{type} MENU</h3>
+                            {categoryList.filter(c => c.type === type).map(cat => (
+                                <div key={cat.name} className="mb-6">
+                                    <h4 className="text-xs text-zinc-500 mb-2 font-bold px-1">{cat.name}</h4>
+                                    <div className="space-y-2">
+                                        {filteredItems.filter(i => i.category === cat.name).map(item => (
+                                            <div key={item.id} className="bg-zinc-900 p-3 rounded-2xl border border-zinc-700 flex gap-3 items-center">
+                                                <div className="w-12 h-12 bg-black rounded-xl overflow-hidden shrink-0">
+                                                  {item.image ? (
+                                                    <img src={item.image} className={`w-full h-full object-cover ${item.isSoldOut ? 'opacity-40 grayscale' : ''}`} />
+                                                  ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-zinc-700"><Camera size={16}/></div>
+                                                  )}
+                                                </div>
+                                                <div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">{item.name}</div><div className="text-[10px] text-zinc-500">¥{item.price}</div></div>
+                                                <button onClick={() => toggleSoldOut(item)} className={`p-2 rounded-xl ${item.isSoldOut ? 'bg-red-500 text-white' : 'bg-zinc-800 text-zinc-400'}`}><Ban size={16}/></button>
+                                                <button onClick={() => setEditingItem({...item})} className="p-2 rounded-xl bg-zinc-800 text-white" disabled={isGrandLocked && type === 'grand' && !item.isSoldOut}><Edit3 size={16}/></button>
+                                                <button onClick={() => deleteItem(item.id)} className="p-2 rounded-xl bg-zinc-800 text-red-500" disabled={isGrandLocked && type === 'grand'}><Trash2 size={16}/></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    ))}
+                </div>
+              </>
+            )}
+
+            {/* カテゴリ選択モード */}
+            {sortPhase === 'select_category' && (
+              <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 pt-4">
+                <div className="text-center space-y-2 mb-8"><ListFilter className="mx-auto text-orange-500" size={32} /><h2 className="text-lg font-bold">並び替えるカテゴリを選択</h2></div>
+                
+                {/* Seasonal */}
+                <div className="space-y-3">
+                    <h3 className="text-xs font-black text-green-500 uppercase tracking-widest pl-1">Seasonal</h3>
+                    <div className="grid gap-3">
+                        {categoryList.filter(c => c.type === 'seasonal').map(cat => (
+                            <button key={cat.name} onClick={() => selectCategoryToSort(cat.name)} className="w-full bg-zinc-900 p-4 rounded-2xl border border-zinc-700 text-left flex justify-between items-center active:scale-95 transition-transform hover:border-orange-500/50">
+                                <div className="flex flex-col"><span className="font-bold text-sm">{cat.name}</span></div>
+                                <span className="text-xs bg-black/50 px-3 py-1 rounded-full text-zinc-400">{items.filter(i => i.category === cat.name).length} items</span>
+                            </button>
                         ))}
                     </div>
-                ))}
-            </div>
+                </div>
+
+                {/* Grand */}
+                <div className="space-y-3">
+                    <h3 className="text-xs font-black text-blue-500 uppercase tracking-widest pl-1">Grand Menu</h3>
+                    <div className="grid gap-3">
+                        {categoryList.filter(c => c.type === 'grand').map(cat => (
+                            <button key={cat.name} onClick={() => selectCategoryToSort(cat.name)} className="w-full bg-zinc-900 p-4 rounded-2xl border border-zinc-700 text-left flex justify-between items-center active:scale-95 transition-transform hover:border-orange-500/50">
+                                <div className="flex flex-col"><span className="font-bold text-sm">{cat.name}</span></div>
+                                <span className="text-xs bg-black/50 px-3 py-1 rounded-full text-zinc-400">{items.filter(i => i.category === cat.name).length} items</span>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+              </div>
+            )}
+
+            {/* 商品並び替えモード */}
+            {sortPhase === 'sorting' && (
+              <div className="space-y-6 animate-in fade-in slide-in-from-right-4 pt-4">
+                <div className="flex items-center justify-between"><button onClick={() => setSortPhase('select_category')} className="text-zinc-400 text-xs flex items-center gap-1 active:scale-90 transition-transform"><ArrowLeft size={16}/> 戻る</button><button onClick={saveSortedOrder} className="bg-orange-500 text-black px-5 py-2.5 rounded-2xl font-black text-xs flex items-center gap-1 active:scale-95 shadow-xl"><CheckCircle2 size={16}/> 保存して終了</button></div>
+                <div className="space-y-2">{sortingItems.map((item, idx) => (<div key={item.id} className="bg-zinc-800 p-3 rounded-2xl border border-orange-500/30 flex items-center justify-between shadow-2xl"><div className="flex items-center gap-3"><div className="w-12 h-12 bg-black rounded-xl overflow-hidden shrink-0"><img src={item.image} className="w-full h-full object-cover" /></div><span className="font-bold text-sm truncate max-w-[140px]">{item.name}</span></div><div className="flex gap-1"><button onClick={() => moveSortItem(idx, 'up')} className="p-3 bg-black/40 rounded-xl text-white disabled:opacity-20 active:scale-90" disabled={idx === 0}><ArrowUp size={20}/></button><button onClick={() => moveSortItem(idx, 'down')} className="p-3 bg-black/40 rounded-xl text-white disabled:opacity-20 active:scale-90" disabled={idx === sortingItems.length - 1}><ArrowDown size={20}/></button></div></div>))}</div>
+              </div>
+            )}
           </div>
         )}
 
+        {/* Categories Tab */}
         {activeTab === 'categories' && (
           <div className="space-y-6 pb-20">
             <div className="flex items-center justify-between bg-white/5 p-4 rounded-xl border border-white/10">
@@ -486,9 +574,34 @@ export default function AdminApp() {
             </div>
             {featuredSlots.map((slot, idx) => (
                 <div key={idx} className={CARD_STYLE}>
-                    <span className="text-[10px] font-bold text-zinc-500 mb-2 block">SLOT {idx+1}</span>
-                    <input value={slot.name || ""} onChange={e => {const ns=[...featuredSlots]; ns[idx].name=e.target.value; setFeaturedSlots(ns)}} placeholder="Title" className={INPUT_STYLE} />
+                    <div className="flex justify-between text-[10px] font-bold text-zinc-500 mb-2">
+                        <span>SLOT {idx+1}</span>
+                        {!slot.itemId && <span className="text-orange-500 flex items-center gap-1"><AlertTriangle size={10}/> 未設定</span>}
+                    </div>
+                    <select 
+                      className={INPUT_STYLE}
+                      value={slot.itemId || ""}
+                      onChange={(e) => {
+                        const targetId = e.target.value;
+                        const ns = [...featuredSlots];
+                        if (!targetId) {
+                          ns[idx] = { ...ns[idx], itemId: null };
+                        } else {
+                          const item = items.find(i => i.id === targetId);
+                          if (item) ns[idx] = { ...ns[idx], itemId: item.id, name: item.name, desc: item.desc, price: item.price, image: item.image || ns[idx].image, category: item.category };
+                        }
+                        setFeaturedSlots(ns);
+                      }}
+                    >
+                      <option value="">▼ 既存商品から選ぶ (翻訳不要)</option>
+                      {items.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}
+                    </select>
+                    <input value={slot.name || ""} onChange={e => {const ns=[...featuredSlots]; ns[idx].name=e.target.value; setFeaturedSlots(ns)}} placeholder="Title" className={`${INPUT_STYLE} mt-2`} />
                     <textarea value={slot.desc || ""} onChange={e => {const ns=[...featuredSlots]; ns[idx].desc=e.target.value; setFeaturedSlots(ns)}} placeholder="Desc" className={`${INPUT_STYLE} mt-2 h-20`} />
+                    <select value={slot.category || ""} onChange={e => {const ns=[...featuredSlots]; ns[idx].category=e.target.value; setFeaturedSlots(ns)}} className={`${INPUT_STYLE} mt-2`}>
+                        <option value="">Category...</option>
+                        {displayCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                    </select>
                 </div>
             ))}
           </div>
@@ -499,7 +612,13 @@ export default function AdminApp() {
           <div className="space-y-8">
             <div className={CARD_STYLE}>
               <h3 className="font-bold text-orange-500 text-xs mb-4">GENERAL</h3>
-              <button onClick={saveGeneralSettings} disabled={isProcessing} className="w-full bg-white text-black font-black py-4 rounded-2xl">全設定保存</button>
+              <div className="flex items-center gap-2 mb-2 text-zinc-400 text-xs"><Star size={12}/> Grand Menu Title</div>
+              <input value={tabSettings.grand?.jp || ""} onChange={e => setTabSettings({...tabSettings, grand: {...(tabSettings?.grand || {}), jp: e.target.value}})} className={INPUT_STYLE} />
+              
+              <div className="flex items-center gap-2 mt-4 mb-2 text-zinc-400 text-xs"><Info size={12}/> Seasonal Menu Title</div>
+              <input value={tabSettings.seasonal?.jp || ""} onChange={e => setTabSettings({...tabSettings, seasonal: {...(tabSettings?.seasonal || {}), jp: e.target.value}})} className={INPUT_STYLE} />
+
+              <button onClick={saveGeneralSettings} disabled={isProcessing} className="w-full bg-white text-black font-black py-4 rounded-2xl mt-6">全設定保存</button>
             </div>
             <div className="text-center"><button onClick={() => setShowCreditModal(true)} className="text-xs text-zinc-600"><Info size={12} className="inline"/> Info</button></div>
           </div>
@@ -512,12 +631,12 @@ export default function AdminApp() {
             <div className="w-full max-w-lg bg-zinc-900 rounded-3xl p-6 space-y-4 border border-zinc-700">
                 <div className="flex justify-between"><h3 className="font-bold">Edit Item</h3><button onClick={() => setEditingItem(null)}><X/></button></div>
                 <div className="flex gap-4">
-                    <div className="w-20 h-20 bg-black rounded flex items-center justify-center relative overflow-hidden">
-                        {/* ★修正: 画像がある時だけimgを表示 */}
+                    <div className="w-20 h-20 bg-black rounded flex items-center justify-center relative overflow-hidden border border-zinc-700">
+                        {/* 画像があれば表示、なければAdd文字（カメラアイコンは一覧用） */}
                         {editingItem.image ? (
                             <img src={editingItem.image} className="w-full h-full object-cover"/>
                         ) : (
-                            <Camera className="text-zinc-600"/>
+                            <span className="text-[10px] text-zinc-600">Add</span>
                         )}
                         <input type="file" className="absolute inset-0 opacity-0" onChange={e => handleImageUpload(e, (url) => setEditingItem({...editingItem, image: url}))}/>
                     </div>
