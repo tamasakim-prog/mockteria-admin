@@ -3,6 +3,8 @@ import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "fire
 import { Plus, Trash2, Loader2, Settings, LayoutTemplate, Coffee, Camera, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, ListFilter, Edit3, X, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search, Star } from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, updateDoc, setDoc, onSnapshot } from "firebase/firestore";
+// ★追加: トースト通知用のライブラリ
+import toast, { Toaster } from 'react-hot-toast';
 
 // --- Config ---
 const TRANSLATE_API_URL = "https://us-central1-mockteria-757c7.cloudfunctions.net/translate"; 
@@ -15,7 +17,7 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
-const PREVIEW_URL = "http://mockkteria-757c7.web.app";
+const PREVIEW_URL = "http://mockteria-757c7.web.app";
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
@@ -88,12 +90,10 @@ export default function AdminApp() {
   const [newItemCategory, setNewItemCategory] = useState("");
   const [newItemImage, setNewItemImage] = useState("");
 
-  // データ同期
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "settings", "menuData"), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
-        
         const loadedItems = data.items || [];
         setItems(loadedItems);
         setFeaturedSlots(data.featuredSlots || Array(5).fill({}));
@@ -101,25 +101,19 @@ export default function AdminApp() {
         setSplashSettings(data.splashSettings || {});
         
         let rawCats = data.categoryList || [];
-        
-        // カテゴリ自動復旧
         if ( (!rawCats || rawCats.length === 0) && loadedItems.length > 0 ) {
-            console.warn("⚠️カテゴリ消失を検知: 自動復旧します");
             const uniqueCatNames = [...new Set(loadedItems.map((i:any) => i.category))];
             rawCats = uniqueCatNames.map(name => {
                 const sampleItem = loadedItems.find((i:any) => i.category === name);
                 return { name: name, type: sampleItem?.type || 'grand' };
             });
         }
-
         if (Array.isArray(rawCats)) {
             const safeCats = rawCats.map((c: any) => {
                 if (typeof c === 'string') return { name: c, type: 'grand' };
                 if (c && typeof c === 'object') return { name: c.name || "Unknown", type: c.type || 'grand' };
                 return null;
             }).filter(Boolean) as any;
-            
-            // 並び替え中・編集中以外は更新を受け入れる
             if (!isCatSorting && !editingCatId && !isProcessing && sortPhase === 'none') {
                 setCategoryList(safeCats);
             }
@@ -174,6 +168,9 @@ export default function AdminApp() {
   const handleImageUpload = async (e: any, callback: (url: string) => void) => {
     const file = e.target.files?.[0]; if (!file) return;
     setUploading(true);
+    // トースト表示: 画像アップロード開始
+    const uploadToast = toast.loading('画像をアップロード中...');
+    
     setTimeout(() => {
         const reader = new FileReader();
         reader.onload = (ev) => {
@@ -185,13 +182,21 @@ export default function AdminApp() {
             const ctx = canvas.getContext('2d');
             ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
             canvas.toBlob(async (blob) => {
-                if (!blob) { setUploading(false); return; }
+                if (!blob) { 
+                    setUploading(false); 
+                    toast.error('画像処理に失敗しました', { id: uploadToast });
+                    return; 
+                }
                 try {
                     const refName = `menu-images/${Date.now()}-${file.name}`;
                     const r = ref(storage, refName);
                     await uploadBytes(r, blob);
-                    callback(await getDownloadURL(r));
-                } catch (e) { alert("画像エラー"); } finally { setUploading(false); }
+                    const url = await getDownloadURL(r);
+                    callback(url);
+                    toast.success('画像の準備完了', { id: uploadToast });
+                } catch (e) { 
+                    toast.error("アップロードエラー", { id: uploadToast }); 
+                } finally { setUploading(false); }
             }, 'image/jpeg', 0.8);
           };
           img.src = ev.target?.result as string;
@@ -201,16 +206,16 @@ export default function AdminApp() {
   };
 
   // --- Core Actions ---
-  
-  const saveAndReload = async (data: any, msg: string) => {
+  // ★修正: リロードなしでトースト通知に変更
+  const saveAndNotify = async (data: any, msg: string) => {
       setIsProcessing(true);
       try {
           await updateDoc(doc(db, "settings", "menuData"), { ...data, updatedAt: new Date() });
-          alert(msg);
-          window.location.reload();
+          toast.success(msg);
       } catch (e: any) {
           console.error(e);
-          alert("エラーが発生しました: " + e.message);
+          toast.error("エラー: " + e.message);
+      } finally {
           setIsProcessing(false);
       }
   };
@@ -218,11 +223,13 @@ export default function AdminApp() {
   const addCategory = async () => {
     if (!newCatName) return;
     const newList = [...categoryList, { name: newCatName, type: newCatType }];
-    await saveAndReload({ categoryList: newList }, "カテゴリを追加しました");
+    await saveAndNotify({ categoryList: newList }, "カテゴリを追加しました");
+    setNewCatName(""); setShowCatForm(false);
   };
 
   const executeCategoryUpdate = async (oldName: string, newName: string, type: MenuType) => {
       setIsProcessing(true);
+      const loadingToast = toast.loading('翻訳・更新中...');
       try {
         const translations: any = {};
         for (const lang of LANGUAGES) {
@@ -238,14 +245,20 @@ export default function AdminApp() {
             }
             return item;
         });
-        await saveAndReload({ categoryList: newList, items: newItems }, "更新しました");
-      } catch(e) { alert("翻訳エラー"); setIsProcessing(false); }
+        await updateDoc(doc(db, "settings", "menuData"), { categoryList: newList, items: newItems, updatedAt: new Date() });
+        setEditingCatId(null);
+        toast.success("更新しました", { id: loadingToast });
+      } catch(e) { 
+          toast.error("更新エラー", { id: loadingToast }); 
+      } finally { 
+          setIsProcessing(false); 
+      }
   };
 
   const deleteCategory = async (catName: string) => {
     if (!confirm("削除しますか？")) return;
     const newList = categoryList.filter(c => c.name !== catName);
-    await saveAndReload({ categoryList: newList }, "削除しました");
+    await saveAndNotify({ categoryList: newList }, "削除しました");
   };
 
   const moveCategory = (currentIndex: number, direction: 'up' | 'down') => {
@@ -264,7 +277,8 @@ export default function AdminApp() {
   };
 
   const saveCategoryOrder = async () => {
-      await saveAndReload({ categoryList }, "並び順を保存しました");
+      await saveAndNotify({ categoryList }, "並び順を保存しました");
+      setIsCatSorting(false);
   };
 
   // --- Item Sorting ---
@@ -280,13 +294,15 @@ export default function AdminApp() {
   const saveSortedOrder = async () => {
     const others = items.filter(i => i.category !== targetCategory);
     await saveToFirebase({ items: [...others, ...sortingItems] });
-    exitSorting(); alert("商品の並び順を保存しました");
+    exitSorting(); 
+    toast.success("商品の並び順を保存しました");
   };
 
   // --- Item Actions ---
   const createNewItem = async () => {
-    if (!newItemName) return alert("名前を入力してください");
+    if (!newItemName) return toast.error("名前を入力してください");
     setIsProcessing(true);
+    const loadingToast = toast.loading('翻訳して登録中...');
     const trans: any = {};
     for (const l of LANGUAGES) {
         const res = await translateTexts([newItemName, newItemDesc, newItemCategory], l.target);
@@ -297,7 +313,7 @@ export default function AdminApp() {
     };
     await setDoc(doc(db, "settings", "menuData"), { items: [...items, newItem], updatedAt: new Date() }, { merge: true });
     setNewItemName(""); setNewItemDesc(""); setNewItemPrice(""); setNewItemImage(""); setShowItemForm(false); setIsProcessing(false);
-    alert("登録しました");
+    toast.success("登録しました", { id: loadingToast });
   };
 
   const deleteItem = async (itemId: string) => {
@@ -306,25 +322,29 @@ export default function AdminApp() {
       if (target?.image?.startsWith('http')) deleteObject(ref(storage, target.image)).catch(()=>{});
       const newItems = items.filter(i => i.id !== itemId);
       await setDoc(doc(db, "settings", "menuData"), { items: newItems, updatedAt: new Date() }, { merge: true });
-      alert("削除しました");
+      setEditingItem(null);
+      toast.success("削除しました");
   };
 
   const toggleSoldOut = async (item: any) => {
     const newItems = items.map(i => i.id === item.id ? { ...i, isSoldOut: !i.isSoldOut } : i);
     await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
+    toast.success(item.isSoldOut ? "販売再開" : "売切に設定しました", { icon: item.isSoldOut ? '🙆‍♂️' : '🚫' });
   };
 
   const saveEditedItem = async () => {
     if (!editingItem) return;
     const newItems = items.map(i => i.id === editingItem.id ? editingItem : i);
     await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
-    setEditingItem(null); alert("保存しました");
+    setEditingItem(null); 
+    toast.success("保存しました");
   };
 
   const reTranslateAndSaveItem = async () => {
     if (!editingItem) return;
     if (!confirm("再翻訳しますか？")) return;
     setIsProcessing(true);
+    const loadingToast = toast.loading('再翻訳中...');
     const translations: any = {};
     for (const lang of LANGUAGES) {
         const results = await translateTexts([editingItem.name, editingItem.desc, editingItem.category], lang.target);
@@ -333,7 +353,8 @@ export default function AdminApp() {
     const updatedItem = { ...editingItem, translations, categoryEnglish: translations['en']?.category || editingItem.category };
     const newItems = items.map(i => i.id === editingItem.id ? updatedItem : i);
     await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
-    setEditingItem(null); setIsProcessing(false); alert("翻訳更新しました");
+    setEditingItem(null); setIsProcessing(false); 
+    toast.success("翻訳更新しました", { id: loadingToast });
   };
 
   const saveToFirebase = async (payload: any) => {
@@ -342,24 +363,29 @@ export default function AdminApp() {
         await setDoc(doc(db, "settings", "menuData"), { ...payload, updatedAt: new Date() }, { merge: true }); 
     } catch (e: any) { 
         console.error(e);
-        alert("保存エラー"); 
+        toast.error("保存エラー"); 
     } finally { setIsProcessing(false); }
   };
 
   const saveFeaturedSettings = async () => {
     setIsProcessing(true);
     await setDoc(doc(db, "settings", "menuData"), { featuredSlots, updatedAt: new Date() }, { merge: true });
-    setIsProcessing(false); alert("保存しました");
+    setIsProcessing(false); 
+    toast.success("ヘッダー設定を保存しました");
   };
 
   const saveGeneralSettings = async () => {
     setIsProcessing(true);
     await setDoc(doc(db, "settings", "menuData"), { tabSettings, splashSettings, updatedAt: new Date() }, { merge: true });
-    setIsProcessing(false); alert("保存しました");
+    setIsProcessing(false); 
+    toast.success("設定を保存しました");
   };
 
   return (
     <div className="min-h-screen bg-black text-slate-100 font-sans pb-24">
+      {/* ★トースター設置（通知の表示場所） */}
+      <Toaster position="bottom-center" toastOptions={{ style: { background: '#333', color: '#fff' } }} />
+
       {/* Header */}
       <header className="sticky top-0 z-50 bg-black/80 backdrop-blur-md border-b border-white/10 px-4 py-4 flex items-center justify-between">
         <h1 className="text-xl font-black text-white tracking-[0.2em] font-['Shippori_Mincho']">MOCKTERIA</h1>
@@ -375,7 +401,6 @@ export default function AdminApp() {
         {activeTab === 'items' && (
           <div className="space-y-6">
             <div className="flex justify-end h-10">
-              {/* 商品並び替えボタン */}
               {sortPhase === 'none' ? (
                 <button onClick={startSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-black">
                   <Move size={14} className="text-orange-500"/> 並び替えモードへ
@@ -387,7 +412,6 @@ export default function AdminApp() {
               )}
             </div>
 
-            {/* AI Search Bar */}
             {sortPhase === 'none' && !editingItem && (
                 <div className="relative mb-4">
                     <Search className="absolute left-4 top-3.5 text-zinc-500" size={18} />
@@ -454,12 +478,9 @@ export default function AdminApp() {
               </>
             )}
 
-            {/* カテゴリ選択モード */}
             {sortPhase === 'select_category' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 pt-4">
                 <div className="text-center space-y-2 mb-8"><ListFilter className="mx-auto text-orange-500" size={32} /><h2 className="text-lg font-bold">並び替えるカテゴリを選択</h2></div>
-                
-                {/* Seasonal */}
                 <div className="space-y-3">
                     <h3 className="text-xs font-black text-green-500 uppercase tracking-widest pl-1">Seasonal</h3>
                     <div className="grid gap-3">
@@ -471,8 +492,6 @@ export default function AdminApp() {
                         ))}
                     </div>
                 </div>
-
-                {/* Grand */}
                 <div className="space-y-3">
                     <h3 className="text-xs font-black text-blue-500 uppercase tracking-widest pl-1">Grand Menu</h3>
                     <div className="grid gap-3">
@@ -487,7 +506,6 @@ export default function AdminApp() {
               </div>
             )}
 
-            {/* 商品並び替えモード */}
             {sortPhase === 'sorting' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-right-4 pt-4">
                 <div className="flex items-center justify-between"><button onClick={() => setSortPhase('select_category')} className="text-zinc-400 text-xs flex items-center gap-1 active:scale-90 transition-transform"><ArrowLeft size={16}/> 戻る</button><button onClick={saveSortedOrder} className="bg-orange-500 text-black px-5 py-2.5 rounded-2xl font-black text-xs flex items-center gap-1 active:scale-95 shadow-xl"><CheckCircle2 size={16}/> 保存して終了</button></div>
@@ -632,7 +650,6 @@ export default function AdminApp() {
                 <div className="flex justify-between"><h3 className="font-bold">Edit Item</h3><button onClick={() => setEditingItem(null)}><X/></button></div>
                 <div className="flex gap-4">
                     <div className="w-20 h-20 bg-black rounded flex items-center justify-center relative overflow-hidden border border-zinc-700">
-                        {/* 画像があれば表示、なければAdd文字（カメラアイコンは一覧用） */}
                         {editingItem.image ? (
                             <img src={editingItem.image} className="w-full h-full object-cover"/>
                         ) : (
@@ -645,6 +662,38 @@ export default function AdminApp() {
                         <input value={editingItem.price} onChange={e => setEditingItem({...editingItem, price: e.target.value})} className={INPUT_STYLE} />
                     </div>
                 </div>
+                
+                <div className="grid grid-cols-2 gap-3">
+                    <div>
+                        <span className="text-[10px] text-zinc-500 font-bold block mb-1">Type</span>
+                        <select 
+                            value={editingItem.type} 
+                            onChange={e => {
+                                const newType = e.target.value as MenuType;
+                                setEditingItem({...editingItem, type: newType, category: ''});
+                            }} 
+                            className={INPUT_STYLE}
+                            disabled={isGrandLocked}
+                        >
+                            <option value="seasonal">Seasonal</option>
+                            <option value="grand">Grand</option>
+                        </select>
+                    </div>
+                    <div>
+                        <span className="text-[10px] text-zinc-500 font-bold block mb-1">Category</span>
+                        <select 
+                            value={editingItem.category} 
+                            onChange={e => setEditingItem({...editingItem, category: e.target.value})} 
+                            className={INPUT_STYLE}
+                        >
+                            <option value="">Select...</option>
+                            {categoryList.filter(c => c.type === editingItem.type).map(c => (
+                                <option key={c.name} value={c.name}>{c.name}</option>
+                            ))}
+                        </select>
+                    </div>
+                </div>
+
                 <textarea value={editingItem.desc} onChange={e => setEditingItem({...editingItem, desc: e.target.value})} className={`${INPUT_STYLE} h-24`} />
                 <div className="flex gap-2">
                     <button onClick={saveEditedItem} className="flex-1 bg-white text-black py-3 rounded-xl font-bold">Save</button>
