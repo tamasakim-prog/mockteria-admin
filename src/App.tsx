@@ -2,8 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { Plus, Trash2, Loader2, Settings, LayoutTemplate, Coffee, Camera, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, ListFilter, Edit3, X, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search, Star } from 'lucide-react';
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, updateDoc, setDoc, onSnapshot } from "firebase/firestore";
-// ★追加: トースト通知用のライブラリ
+import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
 import toast, { Toaster } from 'react-hot-toast';
 
 // --- Config ---
@@ -17,7 +16,7 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
-const PREVIEW_URL = "http://mockteria-757c7.web.app";
+const PREVIEW_URL = "https://mockteria-757c7.web.app";
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
@@ -27,6 +26,9 @@ const LANGUAGES = [{code:'en',target:'EN-US'},{code:'fr',target:'FR'},{code:'it'
 type MenuType = 'grand' | 'seasonal';
 const INPUT_STYLE = "w-full bg-zinc-950 border border-zinc-600 rounded-xl p-3 text-sm text-white placeholder-zinc-500 focus:border-orange-500 focus:outline-none transition-all shadow-inner";
 const CARD_STYLE = "bg-zinc-900 p-5 rounded-3xl border border-zinc-700/50 space-y-4 shadow-xl";
+
+// データ整形用
+const sanitize = (obj: any) => JSON.parse(JSON.stringify(obj));
 
 const calculateSimilarity = (s1: string, s2: string): number => {
   if (!s1 || !s2) return 0;
@@ -90,10 +92,12 @@ export default function AdminApp() {
   const [newItemCategory, setNewItemCategory] = useState("");
   const [newItemImage, setNewItemImage] = useState("");
 
+  // データ同期
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "settings", "menuData"), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
+        
         const loadedItems = data.items || [];
         setItems(loadedItems);
         setFeaturedSlots(data.featuredSlots || Array(5).fill({}));
@@ -101,19 +105,24 @@ export default function AdminApp() {
         setSplashSettings(data.splashSettings || {});
         
         let rawCats = data.categoryList || [];
+        
+        // カテゴリ自動復旧
         if ( (!rawCats || rawCats.length === 0) && loadedItems.length > 0 ) {
+            console.warn("⚠️カテゴリ消失を検知: 自動復旧します");
             const uniqueCatNames = [...new Set(loadedItems.map((i:any) => i.category))];
             rawCats = uniqueCatNames.map(name => {
                 const sampleItem = loadedItems.find((i:any) => i.category === name);
                 return { name: name, type: sampleItem?.type || 'grand' };
             });
         }
+
         if (Array.isArray(rawCats)) {
             const safeCats = rawCats.map((c: any) => {
                 if (typeof c === 'string') return { name: c, type: 'grand' };
                 if (c && typeof c === 'object') return { name: c.name || "Unknown", type: c.type || 'grand' };
                 return null;
             }).filter(Boolean) as any;
+            
             if (!isCatSorting && !editingCatId && !isProcessing && sortPhase === 'none') {
                 setCategoryList(safeCats);
             }
@@ -168,9 +177,7 @@ export default function AdminApp() {
   const handleImageUpload = async (e: any, callback: (url: string) => void) => {
     const file = e.target.files?.[0]; if (!file) return;
     setUploading(true);
-    // トースト表示: 画像アップロード開始
     const uploadToast = toast.loading('画像をアップロード中...');
-    
     setTimeout(() => {
         const reader = new FileReader();
         reader.onload = (ev) => {
@@ -205,25 +212,24 @@ export default function AdminApp() {
     }, 100);
   };
 
-  // --- Core Actions ---
-  // ★修正: リロードなしでトースト通知に変更
-  const saveAndNotify = async (data: any, msg: string) => {
-      setIsProcessing(true);
-      try {
-          await updateDoc(doc(db, "settings", "menuData"), { ...data, updatedAt: new Date() });
-          toast.success(msg);
-      } catch (e: any) {
-          console.error(e);
-          toast.error("エラー: " + e.message);
-      } finally {
-          setIsProcessing(false);
-      }
+  // 保存処理の統一
+  const saveToFirebase = async (payload: any, successMessage?: string) => {
+    setIsProcessing(true);
+    try { 
+        const safePayload = sanitize({ ...payload, updatedAt: new Date() });
+        await setDoc(doc(db, "settings", "menuData"), safePayload, { merge: true }); 
+        if (successMessage) toast.success(successMessage);
+    } catch (e: any) { 
+        console.error("Save Error:", e);
+        toast.error("保存エラー: " + e.message); 
+    } finally { setIsProcessing(false); }
   };
 
   const addCategory = async () => {
     if (!newCatName) return;
     const newList = [...categoryList, { name: newCatName, type: newCatType }];
-    await saveAndNotify({ categoryList: newList }, "カテゴリを追加しました");
+    setCategoryList(newList);
+    await saveToFirebase({ categoryList: newList }, "カテゴリを追加しました");
     setNewCatName(""); setShowCatForm(false);
   };
 
@@ -245,7 +251,8 @@ export default function AdminApp() {
             }
             return item;
         });
-        await updateDoc(doc(db, "settings", "menuData"), { categoryList: newList, items: newItems, updatedAt: new Date() });
+        
+        await saveToFirebase({ categoryList: newList, items: newItems });
         setEditingCatId(null);
         toast.success("更新しました", { id: loadingToast });
       } catch(e) { 
@@ -258,7 +265,8 @@ export default function AdminApp() {
   const deleteCategory = async (catName: string) => {
     if (!confirm("削除しますか？")) return;
     const newList = categoryList.filter(c => c.name !== catName);
-    await saveAndNotify({ categoryList: newList }, "削除しました");
+    setCategoryList(newList);
+    await saveToFirebase({ categoryList: newList }, "削除しました");
   };
 
   const moveCategory = (currentIndex: number, direction: 'up' | 'down') => {
@@ -277,7 +285,7 @@ export default function AdminApp() {
   };
 
   const saveCategoryOrder = async () => {
-      await saveAndNotify({ categoryList }, "並び順を保存しました");
+      await saveToFirebase({ categoryList }, "並び順を保存しました");
       setIsCatSorting(false);
   };
 
@@ -292,10 +300,21 @@ export default function AdminApp() {
     setSortingItems(arr);
   };
   const saveSortedOrder = async () => {
-    const others = items.filter(i => i.category !== targetCategory);
-    await saveToFirebase({ items: [...others, ...sortingItems] });
+    const sortedIds = sortingItems.map(i => i.id);
+    const remainingItems = items.filter(i => !sortedIds.includes(i.id));
+    
+    let insertIndex = items.findIndex(i => i.category === targetCategory);
+    if (insertIndex === -1) insertIndex = remainingItems.length;
+
+    const newItemsOrder = [
+        ...remainingItems.slice(0, insertIndex),
+        ...sortingItems,
+        ...remainingItems.slice(insertIndex)
+    ];
+    const uniqueItems = Array.from(new Map(newItemsOrder.map(item => [item.id, item])).values());
+
+    await saveToFirebase({ items: uniqueItems }, "商品の並び順を保存しました");
     exitSorting(); 
-    toast.success("商品の並び順を保存しました");
   };
 
   // --- Item Actions ---
@@ -311,7 +330,7 @@ export default function AdminApp() {
     const newItem = {
       id: `id-${Date.now()}`, name: newItemName, desc: newItemDesc, price: newItemPrice, image: newItemImage, category: newItemCategory, type: newItemType, isSoldOut: false, translations: trans
     };
-    await setDoc(doc(db, "settings", "menuData"), { items: [...items, newItem], updatedAt: new Date() }, { merge: true });
+    await saveToFirebase({ items: [...items, newItem] });
     setNewItemName(""); setNewItemDesc(""); setNewItemPrice(""); setNewItemImage(""); setShowItemForm(false); setIsProcessing(false);
     toast.success("登録しました", { id: loadingToast });
   };
@@ -321,23 +340,25 @@ export default function AdminApp() {
       const target = items.find(i => i.id === itemId);
       if (target?.image?.startsWith('http')) deleteObject(ref(storage, target.image)).catch(()=>{});
       const newItems = items.filter(i => i.id !== itemId);
-      await setDoc(doc(db, "settings", "menuData"), { items: newItems, updatedAt: new Date() }, { merge: true });
+      await saveToFirebase({ items: newItems }, "削除しました");
       setEditingItem(null);
-      toast.success("削除しました");
   };
 
   const toggleSoldOut = async (item: any) => {
     const newItems = items.map(i => i.id === item.id ? { ...i, isSoldOut: !i.isSoldOut } : i);
-    await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
+    await saveToFirebase({ items: newItems });
     toast.success(item.isSoldOut ? "販売再開" : "売切に設定しました", { icon: item.isSoldOut ? '🙆‍♂️' : '🚫' });
   };
 
   const saveEditedItem = async () => {
     if (!editingItem) return;
+    if (!editingItem.category) {
+        toast.error("カテゴリを選択してください！");
+        return;
+    }
     const newItems = items.map(i => i.id === editingItem.id ? editingItem : i);
-    await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
+    await saveToFirebase({ items: newItems }, "保存しました");
     setEditingItem(null); 
-    toast.success("保存しました");
   };
 
   const reTranslateAndSaveItem = async () => {
@@ -352,38 +373,23 @@ export default function AdminApp() {
     }
     const updatedItem = { ...editingItem, translations, categoryEnglish: translations['en']?.category || editingItem.category };
     const newItems = items.map(i => i.id === editingItem.id ? updatedItem : i);
-    await setDoc(doc(db, "settings", "menuData"), { items: newItems }, { merge: true });
+    
+    await saveToFirebase({ items: newItems });
     setEditingItem(null); setIsProcessing(false); 
     toast.success("翻訳更新しました", { id: loadingToast });
   };
 
-  const saveToFirebase = async (payload: any) => {
-    setIsProcessing(true);
-    try { 
-        await setDoc(doc(db, "settings", "menuData"), { ...payload, updatedAt: new Date() }, { merge: true }); 
-    } catch (e: any) { 
-        console.error(e);
-        toast.error("保存エラー"); 
-    } finally { setIsProcessing(false); }
-  };
-
   const saveFeaturedSettings = async () => {
-    setIsProcessing(true);
-    await setDoc(doc(db, "settings", "menuData"), { featuredSlots, updatedAt: new Date() }, { merge: true });
-    setIsProcessing(false); 
-    toast.success("ヘッダー設定を保存しました");
+    await saveToFirebase({ featuredSlots }, "ヘッダー設定を保存しました");
   };
 
   const saveGeneralSettings = async () => {
-    setIsProcessing(true);
-    await setDoc(doc(db, "settings", "menuData"), { tabSettings, splashSettings, updatedAt: new Date() }, { merge: true });
-    setIsProcessing(false); 
-    toast.success("設定を保存しました");
+    await saveToFirebase({ tabSettings, splashSettings }, "設定を保存しました");
   };
 
   return (
     <div className="min-h-screen bg-black text-slate-100 font-sans pb-24">
-      {/* ★トースター設置（通知の表示場所） */}
+      {/* ★トースター設置 */}
       <Toaster position="bottom-center" toastOptions={{ style: { background: '#333', color: '#fff' } }} />
 
       {/* Header */}
@@ -401,6 +407,7 @@ export default function AdminApp() {
         {activeTab === 'items' && (
           <div className="space-y-6">
             <div className="flex justify-end h-10">
+              {/* 商品並び替えボタン */}
               {sortPhase === 'none' ? (
                 <button onClick={startSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 active:scale-95 transition-transform shadow-lg shadow-black">
                   <Move size={14} className="text-orange-500"/> 並び替えモードへ
@@ -412,6 +419,7 @@ export default function AdminApp() {
               )}
             </div>
 
+            {/* AI Search Bar */}
             {sortPhase === 'none' && !editingItem && (
                 <div className="relative mb-4">
                     <Search className="absolute left-4 top-3.5 text-zinc-500" size={18} />
@@ -454,7 +462,8 @@ export default function AdminApp() {
                                 <div key={cat.name} className="mb-6">
                                     <h4 className="text-xs text-zinc-500 mb-2 font-bold px-1">{cat.name}</h4>
                                     <div className="space-y-2">
-                                        {filteredItems.filter(i => i.category === cat.name).map(item => (
+                                        {/* ★修正: フィルタリング時に「タイプ」もチェックする */}
+                                        {filteredItems.filter(i => i.category === cat.name && i.type === type).map(item => (
                                             <div key={item.id} className="bg-zinc-900 p-3 rounded-2xl border border-zinc-700 flex gap-3 items-center">
                                                 <div className="w-12 h-12 bg-black rounded-xl overflow-hidden shrink-0">
                                                   {item.image ? (
@@ -478,9 +487,12 @@ export default function AdminApp() {
               </>
             )}
 
+            {/* カテゴリ選択モード */}
             {sortPhase === 'select_category' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 pt-4">
                 <div className="text-center space-y-2 mb-8"><ListFilter className="mx-auto text-orange-500" size={32} /><h2 className="text-lg font-bold">並び替えるカテゴリを選択</h2></div>
+                
+                {/* Seasonal */}
                 <div className="space-y-3">
                     <h3 className="text-xs font-black text-green-500 uppercase tracking-widest pl-1">Seasonal</h3>
                     <div className="grid gap-3">
@@ -492,6 +504,8 @@ export default function AdminApp() {
                         ))}
                     </div>
                 </div>
+
+                {/* Grand */}
                 <div className="space-y-3">
                     <h3 className="text-xs font-black text-blue-500 uppercase tracking-widest pl-1">Grand Menu</h3>
                     <div className="grid gap-3">
@@ -506,6 +520,7 @@ export default function AdminApp() {
               </div>
             )}
 
+            {/* 商品並び替えモード */}
             {sortPhase === 'sorting' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-right-4 pt-4">
                 <div className="flex items-center justify-between"><button onClick={() => setSortPhase('select_category')} className="text-zinc-400 text-xs flex items-center gap-1 active:scale-90 transition-transform"><ArrowLeft size={16}/> 戻る</button><button onClick={saveSortedOrder} className="bg-orange-500 text-black px-5 py-2.5 rounded-2xl font-black text-xs flex items-center gap-1 active:scale-95 shadow-xl"><CheckCircle2 size={16}/> 保存して終了</button></div>
@@ -650,6 +665,7 @@ export default function AdminApp() {
                 <div className="flex justify-between"><h3 className="font-bold">Edit Item</h3><button onClick={() => setEditingItem(null)}><X/></button></div>
                 <div className="flex gap-4">
                     <div className="w-20 h-20 bg-black rounded flex items-center justify-center relative overflow-hidden border border-zinc-700">
+                        {/* 画像があれば表示、なければAdd文字 */}
                         {editingItem.image ? (
                             <img src={editingItem.image} className="w-full h-full object-cover"/>
                         ) : (
@@ -663,6 +679,7 @@ export default function AdminApp() {
                     </div>
                 </div>
                 
+                {/* メニュー種別とカテゴリの変更機能 */}
                 <div className="grid grid-cols-2 gap-3">
                     <div>
                         <span className="text-[10px] text-zinc-500 font-bold block mb-1">Type</span>
@@ -670,10 +687,10 @@ export default function AdminApp() {
                             value={editingItem.type} 
                             onChange={e => {
                                 const newType = e.target.value as MenuType;
-                                setEditingItem({...editingItem, type: newType, category: ''});
+                                setEditingItem({...editingItem, type: newType, category: ''}); // タイプ変更時はカテゴリをクリア
                             }} 
                             className={INPUT_STYLE}
-                            disabled={isGrandLocked}
+                            disabled={isGrandLocked} // ロック時はタイプ変更不可
                         >
                             <option value="seasonal">Seasonal</option>
                             <option value="grand">Grand</option>
@@ -687,6 +704,7 @@ export default function AdminApp() {
                             className={INPUT_STYLE}
                         >
                             <option value="">Select...</option>
+                            {/* 現在のタイプに合ったカテゴリのみ表示 */}
                             {categoryList.filter(c => c.type === editingItem.type).map(c => (
                                 <option key={c.name} value={c.name}>{c.name}</option>
                             ))}
