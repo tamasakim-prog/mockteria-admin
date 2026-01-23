@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
-import { Plus, Trash2, RefreshCw, Loader2, Settings, LayoutTemplate, Coffee, Camera, ChevronDown, ArrowUp, ArrowDown, Move, CheckCircle2, Edit3, X, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Search } from 'lucide-react';
+import { Save, Plus, Trash2, RefreshCw, Loader2, Settings, LayoutTemplate, Coffee, Camera, ChevronDown, ArrowUp, ArrowDown, Move, ArrowLeft, CheckCircle2, Edit3, X, Eye, Ban, Layers, Lock, Unlock, AlertTriangle, Info, Search } from 'lucide-react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 
 // --- Config ---
 const firebaseConfig = {
@@ -18,6 +19,7 @@ const PREVIEW_URL = "https://mockteria-757c7.web.app";
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
+const storage = getStorage(app);
 
 const LANGUAGES = [
   { code: 'en', target: 'EN-US' },
@@ -112,12 +114,6 @@ export default function AdminApp() {
     return () => unsub();
   }, [isProcessing, editingItem, editingCategoryName, isCatSorting]);
 
-  useEffect(() => {
-    if (isGrandLocked) {
-      setNewItemType('seasonal');
-    }
-  }, [isGrandLocked]);
-
   // AI Check
   useEffect(() => {
     if (!newItemName) { setNameWarning(null); return; }
@@ -134,6 +130,12 @@ export default function AdminApp() {
       setCatWarning(similarCat.name === newCatName ? `⚠️ 既に存在するカテゴリです` : `⚠️ 類似カテゴリがあります`);
     } else { setCatWarning(null); }
   }, [newCatName, categoryList]);
+
+  useEffect(() => {
+    if (isGrandLocked) {
+      setNewItemType('seasonal');
+    }
+  }, [isGrandLocked]);
 
   // API
   const translateTexts = async (texts: string[], targetLang: string) => {
@@ -157,37 +159,75 @@ export default function AdminApp() {
         await setDoc(doc(db, "settings", "menuData"), dataToSave, { merge: true }); 
         if (successMsg) window.alert(successMsg);
     }
-    catch (e) { window.alert("保存に失敗しました"); console.error(e); } 
+    catch (e) { 
+        console.error(e);
+        window.alert("【保存エラー】\nデータの保存に失敗しました。");
+        throw e;
+    } 
     finally { setIsProcessing(false); }
   };
 
-  const handleImageUpload = (e: any, callback: (base64: string) => void) => {
-    const file = e.target.files?.[0]; if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const scale = 800 / img.width;
-        canvas.width = 800; canvas.height = img.height * scale;
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-        callback(canvas.toDataURL('image/jpeg', 0.7));
-      };
-      img.src = ev.target?.result as string;
-    };
-    reader.readAsDataURL(file);
+  // Storage Upload
+  const handleImageUpload = async (e: any, callback: (url: string) => void) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true); 
+    try {
+        const compressedFile = await new Promise<Blob>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const MAX_WIDTH = 1000;
+                    const scale = MAX_WIDTH / Math.max(img.width, MAX_WIDTH);
+                    canvas.width = img.width * scale;
+                    canvas.height = img.height * scale;
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) {
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        canvas.toBlob((blob) => {
+                            if (blob) resolve(blob);
+                            else reject(new Error("Blob failed"));
+                        }, 'image/jpeg', 0.8);
+                    } else {
+                        reject(new Error("Canvas context failed"));
+                    }
+                };
+                img.onerror = (e) => reject(e);
+                img.src = ev.target?.result as string;
+            };
+            reader.onerror = (e) => reject(e);
+            reader.readAsDataURL(file);
+        });
+
+        const storageRef = ref(storage, `images/${Date.now()}_${file.name}`);
+        await uploadBytes(storageRef, compressedFile);
+        const downloadURL = await getDownloadURL(storageRef);
+        callback(downloadURL);
+        
+    } catch (err) {
+        console.error(err);
+        window.alert("画像のアップロードに失敗しました。\nStorage設定を確認してください。");
+    } finally {
+        setIsProcessing(false);
+    }
   };
 
   // --- Category Actions ---
   const addCategory = async () => {
     if (!newCatName) return;
     if (categoryList.some(c => c.name === newCatName)) return alert("既に同名のカテゴリが存在します");
-    const newList = [...categoryList, { name: newCatName }];
-    setCategoryList(newList); setNewCatName(""); setShowCatForm(false);
-    await saveToFirebase({ categoryList: newList }, "カテゴリを追加しました");
+    setIsProcessing(true);
+    try {
+        const newList = [...categoryList, { name: newCatName }];
+        await saveToFirebase({ categoryList: newList }, "カテゴリを追加しました");
+        setCategoryList(newList); setNewCatName(""); setShowCatForm(false);
+    } catch(e) {} finally { setIsProcessing(false); }
   };
 
+  // ★復活させた関数
   const startEditingCategory = (name: string) => {
       setEditingCategoryName(name);
       setEditCatNameInput(name);
@@ -216,17 +256,22 @@ export default function AdminApp() {
             }
             return item;
         });
-        setCategoryList(newList); setItems(newItems); setEditingCategoryName(null);
         await saveToFirebase({ categoryList: newList, items: newItems });
+        setCategoryList(newList); setItems(newItems); setEditingCategoryName(null);
         alert("カテゴリ名を変更し、関連商品を更新しました");
-      } catch (e) { alert("更新エラー"); } finally { setIsProcessing(false); }
+      } catch (e) { 
+          // error handled
+      } finally { setIsProcessing(false); }
   };
 
   const deleteCategory = async (name: string) => {
     if (!confirm(`カテゴリ「${name}」を削除しますか？`)) return;
-    const newList = categoryList.filter(c => c.name !== name);
-    setCategoryList(newList);
-    await saveToFirebase({ categoryList: newList }, "カテゴリを削除しました");
+    setIsProcessing(true);
+    try {
+        const newList = categoryList.filter(c => c.name !== name);
+        await saveToFirebase({ categoryList: newList }, "カテゴリを削除しました");
+        setCategoryList(newList);
+    } catch(e) {} finally { setIsProcessing(false); }
   };
 
   const moveCategory = (idx: number, dir: 'up' | 'down') => {
@@ -237,9 +282,12 @@ export default function AdminApp() {
   };
 
   const saveCategoryOrder = async () => {
-      await saveToFirebase({ categoryList });
-      setIsCatSorting(false);
-      alert("カテゴリ順序を保存しました");
+      setIsProcessing(true);
+      try {
+        await saveToFirebase({ categoryList });
+        setIsCatSorting(false);
+        alert("カテゴリ順序を保存しました");
+      } catch(e) {} finally { setIsProcessing(false); }
   };
 
   // --- Item Actions ---
@@ -256,24 +304,30 @@ export default function AdminApp() {
       const newItem = {
         id: `id-${Date.now()}`, name: newItemName, desc: newItemDesc, price: newItemPrice, image: newItemImage, category: newItemCategory, type: newItemType, categoryEnglish: trans['en']?.category || newItemCategory, isRecommended: false, isInsta: false, isSoldOut: false, translations: trans
       };
-      await saveToFirebase({ items: [...items, newItem] });
+      await saveToFirebase({ items: [...items, newItem] }, "登録しました");
+      setItems([...items, newItem]); 
       setNewItemName(""); setNewItemDesc(""); setNewItemPrice(""); setNewItemImage(""); setShowItemForm(false);
-      alert("登録しました");
-    } catch (e) { alert("登録エラー"); } finally { setIsProcessing(false); }
+    } catch (e) {} finally { setIsProcessing(false); }
   };
 
   const toggleSoldOut = async (item: any) => {
     const newItems = items.map(i => i.id === item.id ? { ...i, isSoldOut: !i.isSoldOut } : i);
     setItems(newItems);
-    await saveToFirebase({ items: newItems });
-    alert(item.isSoldOut ? "販売再開しました" : "売切に設定しました");
+    try {
+        await saveToFirebase({ items: newItems });
+        alert(item.isSoldOut ? "販売再開しました" : "売切に設定しました");
+    } catch(e) { setItems(items); }
   };
 
   const saveEditedItem = async () => {
     if (!editingItem) return;
     const newItems = items.map(i => i.id === editingItem.id ? editingItem : i);
-    await saveToFirebase({ items: newItems }, "保存しました");
-    setEditingItem(null);
+    setIsProcessing(true);
+    try {
+        await saveToFirebase({ items: newItems }, "保存しました");
+        setItems(newItems);
+        setEditingItem(null);
+    } catch(e) {} finally { setIsProcessing(false); }
   };
 
   const reTranslateAndSaveItem = async () => {
@@ -290,6 +344,7 @@ export default function AdminApp() {
       const updatedItem = { ...editingItem, translations, categoryEnglish: translations['en']?.category || editingItem.category };
       const newItems = items.map(i => i.id === editingItem.id ? updatedItem : i);
       await saveToFirebase({ items: newItems });
+      setItems(newItems);
       setEditingItem(null);
       alert("翻訳更新しました");
     } catch(e) { alert("翻訳エラー"); } finally { setIsProcessing(false); }
@@ -298,13 +353,24 @@ export default function AdminApp() {
   const deleteItem = async (itemId: string) => {
       if(!confirm("本当に削除しますか？")) return;
       const newItems = items.filter(i => i.id !== itemId);
-      await saveToFirebase({ items: newItems }, "削除しました");
-      setEditingItem(null);
+      setIsProcessing(true);
+      try {
+        await saveToFirebase({ items: newItems }, "削除しました");
+        setItems(newItems);
+        setEditingItem(null);
+      } catch(e) {} finally { setIsProcessing(false); }
   };
 
   // --- Sorting (Items) ---
+  const startSorting = () => setSortPhase('select_category');
   const exitSorting = () => { setSortPhase('none'); setTargetCategory(""); setSortingItems([]); };
-  
+  const selectCategoryToSort = (cat: string) => { setTargetCategory(cat); setSortingItems(items.filter(i => i.category === cat)); setSortPhase('sorting'); };
+  const moveSortItem = (idx: number, dir: 'up' | 'down') => {
+    const arr = [...sortingItems];
+    if (dir === 'up' && idx > 0) [arr[idx], arr[idx-1]] = [arr[idx-1], arr[idx]];
+    if (dir === 'down' && idx < arr.length-1) [arr[idx], arr[idx+1]] = [arr[idx+1], arr[idx]];
+    setSortingItems(arr);
+  };
   const saveSortedOrder = async () => {
     const sortedIds = sortingItems.map(i => i.id);
     const remainingItems = items.filter(i => !sortedIds.includes(i.id));
@@ -312,8 +378,12 @@ export default function AdminApp() {
     if (insertIndex === -1) insertIndex = remainingItems.length;
     const newItemsOrder = [...remainingItems.slice(0, insertIndex), ...sortingItems, ...remainingItems.slice(insertIndex)];
     const uniqueItems = Array.from(new Map(newItemsOrder.map(item => [item.id, item])).values());
-    await saveToFirebase({ items: uniqueItems }, "並び順を保存しました");
-    exitSorting(); 
+    setIsProcessing(true);
+    try {
+        await saveToFirebase({ items: uniqueItems }, "並び順を保存しました");
+        setItems(uniqueItems);
+        exitSorting();
+    } catch(e) {} finally { setIsProcessing(false); }
   };
 
   // --- Featured & Settings ---
@@ -374,7 +444,6 @@ export default function AdminApp() {
 
   return (
     <div className="min-h-screen bg-black text-slate-100 font-sans pb-24">
-      
       {/* Header */}
       <header className="sticky top-0 z-50 bg-black/80 backdrop-blur-md border-b border-white/10 px-4 py-4 flex items-center justify-between">
         <h1 className="text-xm font-black text-white tracking-[0.2em] font-['Shippori_Mincho']">MOCKTERIA</h1>
@@ -391,9 +460,9 @@ export default function AdminApp() {
           <div className="space-y-6">
             <div className="flex justify-end h-10">
               {sortPhase === 'none' ? (
-                <button onClick={() => setSortPhase('select_category')} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2"><Move size={14} className="text-orange-500"/> 並び替え</button>
+                <button onClick={startSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2"><Move size={14} className="text-orange-500"/> 並び替え</button>
               ) : (
-                <button onClick={exitSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2"><Plus size={14} className="text-orange-500"/> 商品登録へ</button>
+                <button onClick={exitSorting} className="bg-zinc-800 text-white border border-white/20 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2"><ArrowLeft size={14} className="text-orange-500"/> 商品登録へ</button>
               )}
             </div>
 
@@ -474,14 +543,14 @@ export default function AdminApp() {
             {sortPhase === 'select_category' && (
               <div className="space-y-6 pt-4">
                 <div className="text-center mb-8"><h2 className="text-lg font-bold">並び替えるカテゴリを選択</h2></div>
-                <div className="grid gap-3">{categoryList.map(cat => (<button key={cat.name} onClick={() => { setTargetCategory(cat.name); setSortingItems(items.filter(i => i.category === cat.name)); setSortPhase('sorting'); }} className="w-full bg-zinc-900 p-4 rounded-2xl border border-zinc-700 text-left font-bold text-sm">{cat.name}</button>))}</div>
+                <div className="grid gap-3">{categoryList.map(cat => (<button key={cat.name} onClick={() => selectCategoryToSort(cat.name)} className="w-full bg-zinc-900 p-4 rounded-2xl border border-zinc-700 text-left font-bold text-sm">{cat.name}</button>))}</div>
               </div>
             )}
 
             {sortPhase === 'sorting' && (
               <div className="space-y-6 pt-4">
-                <div className="flex justify-between"><button onClick={() => setSortPhase('select_category')} className="text-zinc-400 text-xs">戻る</button><button onClick={saveSortedOrder} className="bg-orange-500 text-black px-5 py-2.5 rounded-2xl font-bold text-xs">保存</button></div>
-                <div className="space-y-2">{sortingItems.map((item, idx) => (<div key={item.id} className="bg-zinc-800 p-3 rounded-2xl flex justify-between items-center"><span className="font-bold text-sm">{item.name}</span><div className="flex gap-1"><button onClick={() => { const arr=[...sortingItems]; if(idx>0){[arr[idx],arr[idx-1]]=[arr[idx-1],arr[idx]]; setSortingItems(arr);} }} className="p-2 bg-black rounded text-white"><ArrowUp/></button><button onClick={() => { const arr=[...sortingItems]; if(idx<arr.length-1){[arr[idx],arr[idx+1]]=[arr[idx+1],arr[idx]]; setSortingItems(arr);} }} className="p-2 bg-black rounded text-white"><ArrowDown/></button></div></div>))}</div>
+                <div className="flex justify-between"><button onClick={() => setSortPhase('select_category')} className="text-zinc-400 text-xs flex items-center gap-1"><ArrowLeft size={16}/> 戻る</button><button onClick={saveSortedOrder} className="bg-orange-500 text-black px-5 py-2.5 rounded-2xl font-bold text-xs flex items-center gap-1"><CheckCircle2 size={16}/> 保存</button></div>
+                <div className="space-y-2">{sortingItems.map((item, idx) => (<div key={item.id} className="bg-zinc-800 p-3 rounded-2xl flex justify-between items-center"><span className="font-bold text-sm">{item.name}</span><div className="flex gap-1"><button onClick={() => moveSortItem(idx, 'up')} className="p-2 bg-black rounded text-white"><ArrowUp/></button><button onClick={() => moveSortItem(idx, 'down')} className="p-2 bg-black rounded text-white"><ArrowDown/></button></div></div>))}</div>
               </div>
             )}
           </div>
@@ -552,7 +621,7 @@ export default function AdminApp() {
           <div className="space-y-6">
             <div className="flex justify-between items-center bg-zinc-900 p-4 rounded-xl border border-zinc-700/50 sticky top-16 z-20 shadow-xl">
               <span className="font-bold text-sm">ヘッダー設定</span>
-              <button onClick={saveFeaturedSettings} disabled={isProcessing} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-bold">保存</button>
+              <button onClick={saveFeaturedSettings} disabled={isProcessing} className="bg-white text-black px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-1"><Save size={14}/>保存</button>
             </div>
             <div className="space-y-6">
               {featuredSlots.map((slot, idx) => (
@@ -584,9 +653,9 @@ export default function AdminApp() {
                 <div><label className="text-[10px] text-zinc-500">Grand Menu Tab Name</label><input value={tabSettings.grand?.jp || ""} onChange={e => setTabSettings({...tabSettings, grand: {...(tabSettings?.grand || {}), jp: e.target.value}})} className={INPUT_STYLE} /></div>
                 <div><label className="text-[10px] text-zinc-500">Seasonal Menu Tab Name</label><input value={tabSettings.seasonal?.jp || ""} onChange={e => setTabSettings({...tabSettings, seasonal: {...(tabSettings?.seasonal || {}), jp: e.target.value}})} className={INPUT_STYLE} /></div>
               </div>
-              <button onClick={saveGeneralSettings} disabled={isProcessing} className="w-full bg-white text-black font-black py-4 rounded-2xl mt-4">全設定を保存・翻訳</button>
+              <button onClick={saveGeneralSettings} disabled={isProcessing} className="w-full bg-white text-black font-black py-4 rounded-2xl mt-4 flex items-center justify-center gap-2"><Save size={16}/>全設定を保存・翻訳</button>
             </div>
-            <div className="flex justify-center"><button onClick={() => setShowCreditModal(true)} className="text-[10px] text-zinc-500 border border-zinc-800 px-4 py-2 rounded-full">クレジット・利用規約</button></div>
+            <div className="flex justify-center"><button onClick={() => setShowCreditModal(true)} className="text-[10px] text-zinc-500 border border-zinc-800 px-4 py-2 rounded-full flex items-center gap-1"><Info size={12}/>クレジット・利用規約</button></div>
           </div>
         )}
       </div>
@@ -612,10 +681,10 @@ export default function AdminApp() {
             </div>
             <textarea value={editingItem.desc || ""} onChange={e => setEditingItem({...editingItem, desc: e.target.value})} className={`${INPUT_STYLE} h-24`}/>
             <div className="flex gap-2">
-                <button onClick={saveEditedItem} className="flex-1 bg-white text-black font-bold py-3 rounded-xl">Save</button>
-                <button onClick={reTranslateAndSaveItem} className="flex-1 bg-blue-600 text-white font-bold py-3 rounded-xl">Translate</button>
+                <button onClick={saveEditedItem} className="flex-1 bg-white text-black font-bold py-3 rounded-xl flex items-center justify-center gap-1"><Save size={16}/> Save</button>
+                <button onClick={reTranslateAndSaveItem} className="flex-1 bg-blue-600 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2"><RefreshCw size={16}/> Translate</button>
             </div>
-            <button onClick={() => deleteItem(editingItem.id)} className="w-full text-red-500 text-xs py-2">Delete Item</button>
+            <button onClick={() => deleteItem(editingItem.id)} className="w-full text-red-500 text-xs py-2 flex items-center justify-center gap-1"><Trash2 size={12}/> Delete Item</button>
           </div>
         </div>
       )}
