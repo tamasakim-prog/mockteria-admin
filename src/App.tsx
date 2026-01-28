@@ -15,6 +15,11 @@ const firebaseConfig = {
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
+// ★★★ ここに Firebase Functions の URL を貼り付けてください ★★★
+// 例: "https://us-central1-mockteria-757c7.cloudfunctions.net/translate"
+// ※ わからない場合は firebase functions:list コマンドで確認できます
+const TRANSLATE_API_URL = "https://us-central1-mockteria-757c7.cloudfunctions.net/translate"; // ← ここを書き換える！！
+
 const PREVIEW_URL = "https://mockteria-757c7.web.app";
 
 const app = initializeApp(firebaseConfig);
@@ -51,6 +56,7 @@ export default function AdminApp() {
   const [categoryList, setCategoryList] = useState<{name: string}[]>([]);
   const [featuredSlots, setFeaturedSlots] = useState<any[]>(Array(5).fill({}));
   const [tabSettings, setTabSettings] = useState<any>({ grand: { jp: "" }, seasonal: { jp: "" } });
+  const [featuredLabel, setFeaturedLabel] = useState<any>({ jp: "今月のおすすめ" });
   
   // UI State
   const [activeTab, setActiveTab] = useState<'items' | 'categories' | 'header' | 'settings'>('items');
@@ -108,6 +114,7 @@ export default function AdminApp() {
                 });
             }
             setCategoryList(safeCats);
+            setFeaturedLabel(data.featuredLabel || { jp: "今月のおすすめ" });
         }
       }
     });
@@ -137,16 +144,22 @@ export default function AdminApp() {
     }
   }, [isGrandLocked]);
 
-  // API
+  // API - 翻訳処理 (修正済み)
   const translateTexts = async (texts: string[], targetLang: string) => {
     try {
-      const response = await fetch('https://mockteria-app.vercel.app/api/translate', {
+      // 指定されたURLへリクエストを送信
+      const response = await fetch(TRANSLATE_API_URL, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: texts, target_lang: targetLang })
+        // provider: 'deepl' を付与して DeepL を使うことを明示
+        body: JSON.stringify({ text: texts, target_lang: targetLang, provider: 'deepl' })
       });
+      if (!response.ok) throw new Error("Translation API request failed");
       const data = await response.json();
       return data.translations.map((t: any) => t.text);
-    } catch (e) { return texts; }
+    } catch (e) { 
+        console.error("Translation Error:", e);
+        return texts; // 失敗時は原文を返す
+    }
   };
 
   const saveToFirebase = async (payload: any, successMsg?: string) => {
@@ -227,7 +240,6 @@ export default function AdminApp() {
     } catch(e) {} finally { setIsProcessing(false); }
   };
 
-  // ★復活させた関数
   const startEditingCategory = (name: string) => {
       setEditingCategoryName(name);
       setEditCatNameInput(name);
@@ -395,11 +407,38 @@ export default function AdminApp() {
       const slotPromises = nextSlots.map(async (slot, index) => {
         if (!slot.name) return slot;
         if (slot.type === 'event') return { ...slot, itemId: null };
+
+        // SLOT が既存商品を参照している場合は、参照先の翻訳を使う（なければ DeepL で作る）
         if (slot.itemId) {
-           const existingIndex = nextItems.findIndex(i => i.id === slot.itemId);
-           if(existingIndex !== -1) nextItems[existingIndex] = { ...nextItems[existingIndex], isRecommended: true };
-           return slot;
+          const existingIndex = nextItems.findIndex(i => i.id === slot.itemId);
+          if (existingIndex !== -1) {
+            nextItems[existingIndex] = { ...nextItems[existingIndex], isRecommended: true };
+            const linked = nextItems[existingIndex];
+            let slotTranslations = linked.translations;
+            if (!slotTranslations) {
+              slotTranslations = {};
+              const promises = LANGUAGES.map(async (lang) => {
+                const results = await translateTexts([linked.name || slot.name, linked.desc || slot.desc, linked.category || slot.category || "NEW"], lang.target);
+                slotTranslations[lang.code] = { name: results[0], desc: results[1], category: results[2] };
+              });
+              await Promise.all(promises);
+            }
+            return {
+              ...slot,
+              itemId: slot.itemId,
+              name: linked.name,
+              desc: linked.desc,
+              price: linked.price,
+              image: linked.image || slot.image,
+              category: linked.category,
+              categoryEnglish: linked.categoryEnglish || linked.category,
+              translations: slotTranslations,
+            };
+          }
+          return slot;
         }
+
+        // 新規スロットは DeepL で翻訳して items に新規登録
         const translations: any = {};
         const promises = LANGUAGES.map(async (lang) => {
           const results = await translateTexts([slot.name, slot.desc, slot.category || "NEW"], lang.target);
@@ -408,10 +447,20 @@ export default function AdminApp() {
         await Promise.all(promises);
         const newItemId = `id-feat-${Date.now()}-${index}`;
         const newItem = {
-          id: newItemId, name: slot.name, desc: slot.desc, price: slot.price, image: slot.image, category: slot.category || "NEW ITEMS", categoryEnglish: translations['en']?.category || slot.category, type: slot.menuType || "grand", isRecommended: true, isSoldOut: false, translations: translations
+          id: newItemId,
+          name: slot.name,
+          desc: slot.desc,
+          price: slot.price,
+          image: slot.image,
+          category: slot.category || "NEW ITEMS",
+          categoryEnglish: translations['en']?.category || slot.category,
+          type: slot.menuType || "grand",
+          isRecommended: true,
+          isSoldOut: false,
+          translations: translations
         };
         nextItems.push(newItem);
-        return { ...slot, itemId: newItemId };
+        return { ...slot, itemId: newItemId, translations };
       });
       const updatedSlots = await Promise.all(slotPromises);
       await setDoc(doc(db, "settings", "menuData"), { items: nextItems, featuredSlots: updatedSlots, tabSettings, updatedAt: new Date() }, { merge: true });
@@ -431,7 +480,8 @@ export default function AdminApp() {
         newTabSettings.seasonal[lang.code] = results[1];
       });
       await Promise.all(promises);
-      await setDoc(doc(db, "settings", "menuData"), { items, featuredSlots, tabSettings: newTabSettings, updatedAt: new Date(), categoryList }, { merge: true });
+      // featuredLabel は管理画面で用意した7言語分をそのまま保存する
+      await setDoc(doc(db, "settings", "menuData"), { items, featuredSlots, tabSettings: newTabSettings, featuredLabel, updatedAt: new Date(), categoryList }, { merge: true });
       alert("設定を保存しました");
     } catch(e) { alert("エラー"); } finally { setIsProcessing(false); }
   };
@@ -652,6 +702,13 @@ export default function AdminApp() {
               <div className="space-y-5 pt-2">
                 <div><label className="text-[10px] text-zinc-500">Grand Menu Tab Name</label><input value={tabSettings.grand?.jp || ""} onChange={e => setTabSettings({...tabSettings, grand: {...(tabSettings?.grand || {}), jp: e.target.value}})} className={INPUT_STYLE} /></div>
                 <div><label className="text-[10px] text-zinc-500">Seasonal Menu Tab Name</label><input value={tabSettings.seasonal?.jp || ""} onChange={e => setTabSettings({...tabSettings, seasonal: {...(tabSettings?.seasonal || {}), jp: e.target.value}})} className={INPUT_STYLE} /></div>
+              </div>
+              <div className="mt-4 space-y-3">
+                <div className="text-[10px] text-zinc-500">ヘッダーラベル（今月のおすすめ） — 各言語分の文字列をここで用意してください（手動入力）</div>
+                <input value={featuredLabel.jp || ""} onChange={e => setFeaturedLabel({...featuredLabel, jp: e.target.value})} className={INPUT_STYLE} placeholder="日本語 (例: 今月のおすすめ)" />
+                {LANGUAGES.map(l => (
+                  <input key={l.code} value={featuredLabel[l.code] || ""} onChange={e => setFeaturedLabel({...featuredLabel, [l.code]: e.target.value})} className={INPUT_STYLE} placeholder={`${l.code} (${l.target || l.code}) の表記`} />
+                ))}
               </div>
               <button onClick={saveGeneralSettings} disabled={isProcessing} className="w-full bg-white text-black font-black py-4 rounded-2xl mt-4 flex items-center justify-center gap-2"><Save size={16}/>全設定を保存・翻訳</button>
             </div>
